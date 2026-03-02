@@ -38,7 +38,7 @@ class Simulation:
         self.yield_every    = sim_dict['yield_every']       # How many timesteps between data yields
 
         # Model parameters
-        self.k              = 20                            # Number of nearest neighbors to consider
+        self.k              = 12                            # Number of nearest neighbors to consider
         self.true_neighbour_max     = 50                    # Maximum number of true neighbors in former timestep
         self.dt             = sim_dict['dt']                # Size of timestep for simulation
         self.sqrt_dt        = np.sqrt(self.dt)              # Square root of time step. We calculate it here instead of in the update loop
@@ -136,7 +136,7 @@ class Simulation:
         dx = x[:, None, :] - full_neighbor_list                                         # Calculate pairwise distances
         
         # exclude cells too far away
-        z_mask = torch.tensor(d < self.interaction_dist, dtype = bool, device = self.device)
+        z_mask = d < self.interaction_dist
 
         # Shorten tensors to avoid unnecessary computations and memory issues
         sort_idx = torch.argsort(z_mask.int(), dim=1, descending=True)              # We sort the boolean voronoi mask in descending order, i.e 1,1,1,...,0,0
@@ -239,8 +239,11 @@ class Simulation:
         alpha_perp_mean = torch.tan(alpha_perp_mean/2)
 
         # Implementing cell wedging
-        Z_par = alpha_par_mean[:,:,None] * (qi * dx).sum(dim=2)[:,:,None] * dx
-        Z_perp = alpha_perp_mean[:,:,None] * (1 - (qi * dx).sum(dim=2))[:,:,None] * dx
+        # with torch.no_grad():
+        perp_dir = torch.cross(qi, pi, dim=2)
+
+        Z_par = alpha_par_mean[:,:,None] * (qi * dx).sum(dim=2)[:,:,None] * qi                                          #* dx
+        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                            #* dx
         Z = Z_par + Z_perp
 
         pi_tilde = pi - Z
@@ -257,7 +260,7 @@ class Simulation:
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
         log_gamma_mean = (gamma_i + gamma_j)/2
-        cos2theta = 2*((qi * dx).sum(dim=2))**2 - 1
+        cos2theta = 2 * ((qi * dx).sum(dim=2))**2 - 1
         d_tilde = d * torch.exp(log_gamma_mean * cos2theta)
 
         # All the S-terms are calculated
@@ -416,9 +419,9 @@ class Simulation:
         # Start with cell division
         division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
-        k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
-        k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
-        d, dx, idx, z_mask = self.get_neighbors(x, k=k)
+        # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
+        # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
+        d, dx, idx, z_mask = self.get_neighbors(x, k=self.k)
   
         # Calculate potential
         V, Vi = self.potential(x, p, q, p_mask,
