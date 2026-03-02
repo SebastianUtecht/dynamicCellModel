@@ -1,0 +1,49 @@
+{
+  "output_folder": "test0",
+  "yield_every": 50,
+  "yield_steps": 500,
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "random_seed": 42,
+  "prolif_rate": 0.0,
+  "prolif_delay": 0,
+  "max_cells": 10000,
+  "lambdas": [
+    0,
+    1.0,
+    0,
+    0
+  ],
+  "etas": 0.05,
+  "alpha_params": [
+    [
+      0.0,
+      "locked"
+    ],
+    [
+      0.0,
+      "locked"
+    ]
+  ],
+  "alpha_range": 45,
+  "gamma_params": [
+    1.0,
+    "locked"
+  ],
+  "gamma_range": 2.0,
+  "cell_wall_interaction": 0.0,
+  "dt": 0.2,
+  "bound_radius": null,
+  "interaction_dist": 4.5,
+  "offsets": [
+    [
+      0,
+      0
+    ],
+    [
+      0,
+      0
+    ]
+  ],
+  "notes": "Running test w. bounds"
+}
