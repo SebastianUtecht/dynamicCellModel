@@ -113,12 +113,12 @@ class Simulation:
         torch.manual_seed(self.random_seed)                 # For reproducibility
 
     def gamma_func(self, qi, dx):
-        dot = torch.sum(qi * dx, dim=2)
+        dot = (qi * dx).sum(dim=2)
         dot = torch.abs(dot)
         val =  1 - 4/np.pi * torch.arccos(dot)
         return val
 
-    def get_neighbors(self, x, k=100):
+    def get_neighbors(self, x, q, gamma, k):
         """
         Finds the k nearest neighbors for each cell and applies a voronoi mask to exclude false neighbors.
         Parameters:
@@ -131,10 +131,19 @@ class Simulation:
             z_mask (torch.Tensor): A boolean mask indicating which neighbors are true neighbors based on a distance cutoff
         """
 
+        # gamma_j = gamma[idx]
+        # log_gamma_mean = (gamma_i + gamma_j)/2
+        # d_tilde = d * torch.exp(log_gamma_mean * cos2theta)
+
         with torch.no_grad():
-            # finding all potential neighbors via knn 
             all_dists = x[:, None] - x[None, :]
+            qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)                    #TODO: Change this to be symmetric. I.e. q_mean = q_i + q_j / 2
+            # gamma_i = gamma[:, None].expand(gamma.shape[0], q.shape[0])
+            # val = 2 * ((qi * all_dists).sum(dim=2))**2 - 1
+            # val = self.gamma_func(qi, all_dists)
+            # finding all potential neighbors via knn 
             d = torch.linalg.norm(all_dists, dim=2)
+            # d = d * torch.exp(gamma_i * 1/val)
             d, idx = d.topk(k+1, dim=1, largest=False, sorted=True)
             d, idx = d[:, 1:], idx[:, 1:]
             
@@ -268,8 +277,8 @@ class Simulation:
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
         log_gamma_mean = (gamma_i + gamma_j)/2
-        # cos2theta = 2 * ((qi * dx).sum(dim=2))**2 - 1
-        val = self.gamma_func(qi, dx)
+        val = 2 * ((qi * dx).sum(dim=2))**2 - 1
+        # val = self.gamma_func(qi, dx)
         d_tilde = d * torch.exp(log_gamma_mean * val)
 
         # Schums way of gamma
@@ -439,7 +448,7 @@ class Simulation:
 
         # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
         # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
-        d, dx, idx, z_mask = self.get_neighbors(x, k=self.k)
+        d, dx, idx, z_mask = self.get_neighbors(x, q, gamma, k=self.k)
   
         # Calculate potential
         V, Vi = self.potential(x, p, q, p_mask,
