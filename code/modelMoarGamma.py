@@ -1041,3 +1041,64 @@ def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_param
 
     sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
     return sphere_data
+
+def make_random_sphere_surface(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
+    """
+    Generates cells uniformly distributed on a sphere 
+    with abp polarities pointing radially outward and randomly initialized pcp polarities.
+
+    Parameters
+        N (int): The number of cells to generate.
+        type0_frac (float): The fraction of cells of type 0.
+        radius (float): The radius of the sphere.
+
+    Returns
+        tuple: A tuple containing the following elements:
+            - mask (np.ndarray): The mask indicating the type of each cell.
+            - x (np.ndarray): The positions of the cells.
+            - p (np.ndarray): The apicobasal polarities of the cells.
+            - q (np.ndarray): The planar cell polarities of the cells
+    """
+
+    # Generate random positions on a sphere
+    x = np.random.randn(N, 3)
+    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
+    x *= radius
+
+    # Generate apicobasal polarities pointing radially outward
+    p = x / np.linalg.norm(x, axis=1)[:, None]
+
+    # Generate random planar cell polarities
+    q = np.random.randn(N, 3)
+    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+
+    # Generate random cell types with specified fractions
+    mask = np.random.choice([0,1], p=[type0_frac, 1-type0_frac], size=N)                #Mask detailing which cells are which type
+
+    alpha_par = np.zeros(N)
+    alpha_perp = np.zeros(N)
+    gamma = np.zeros(N)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]        = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+
+    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return sphere_data
