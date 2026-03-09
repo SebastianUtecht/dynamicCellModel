@@ -439,51 +439,61 @@ class Simulation:
         qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
         qj = q[idx]
         q_mean = (qi + qj)/2
+        
+        if torch.sum(torch.abs(alpha_par)) > 0.0001 or torch.sum(torch.abs(alpha_perp)) > 0.0001:  
+            print('fuck0')
+            # Expanding alpha_par, alpha_perp
+            alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
+            alpha_par_j = alpha_par[idx]
+            alpha_par_mean = (alpha_par_i + alpha_par_j)/2                  # Minimum wedging determines interaction
+            alpha_par_mean = torch.tan(alpha_par_mean/2)
 
-        # Expanding alpha_par, alpha_perp
-        alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
-        alpha_par_j = alpha_par[idx]
-        alpha_par_mean = (alpha_par_i + alpha_par_j)/2                  # Minimum wedging determines interaction
-        alpha_par_mean = torch.tan(alpha_par_mean/2)
+            alpha_perp_i = alpha_perp[:, None].expand(alpha_perp.shape[0], idx.shape[1])
+            alpha_perp_j = alpha_perp[idx]
+            alpha_perp_mean = (alpha_perp_i + alpha_perp_j)/2               # Minimum wedging determines interaction
+            alpha_perp_mean = torch.tan(alpha_perp_mean/2)
 
-        alpha_perp_i = alpha_perp[:, None].expand(alpha_perp.shape[0], idx.shape[1])
-        alpha_perp_j = alpha_perp[idx]
-        alpha_perp_mean = (alpha_perp_i + alpha_perp_j)/2               # Minimum wedging determines interaction
-        alpha_perp_mean = torch.tan(alpha_perp_mean/2)
+            # Implementing cell wedging
+            # with torch.no_grad():
+            perp_dir = torch.cross(q_mean, pi, dim=2)
 
-        # Implementing cell wedging
-        # with torch.no_grad():
-        perp_dir = torch.cross(q_mean, pi, dim=2)
+            Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                          #* dx
+            Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                #* dx
+            Z = Z_par + Z_perp
 
-        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                          #* dx
-        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                #* dx
-        Z = Z_par + Z_perp
+            pi_tilde = pi - Z
+            pj_tilde = pj + Z
 
-        pi_tilde = pi - Z
-        pj_tilde = pj + Z
-
-        # Normalizing the ABPs
-        # wedged_interactions = torch.any((alpha_par_mean > 1e-5) | (alpha_perp_mean > 1e-5), dim=2)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
-        wedged_interactions = torch.logical_or(alpha_par_mean > 1e-5, alpha_perp_mean > 1e-5)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
-        pi_tilde[wedged_interactions] = pi_tilde[wedged_interactions] / torch.sqrt(torch.sum(pi_tilde[wedged_interactions] ** 2, dim=1))[:, None]
-        pj_tilde[wedged_interactions] = pj_tilde[wedged_interactions] / torch.sqrt(torch.sum(pj_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+            # Normalizing the ABPs
+            # wedged_interactions = torch.any((alpha_par_mean > 1e-5) | (alpha_perp_mean > 1e-5), dim=2)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+            wedged_interactions = torch.logical_or(alpha_par_mean > 1e-5, alpha_perp_mean > 1e-5)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+            pi_tilde[wedged_interactions] = pi_tilde[wedged_interactions] / torch.sqrt(torch.sum(pi_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+            pj_tilde[wedged_interactions] = pj_tilde[wedged_interactions] / torch.sqrt(torch.sum(pj_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+        
+        else:
+            pi_tilde = pi
+            pj_tilde = pj
 
         # with torch.no_grad(): # Maybe comment in? dunno will see
 
-        # My way of gamma
-        gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
-        gamma_j = gamma[idx]
-        gamma_mean = (gamma_i + gamma_j)/2
-        
+        # if torch.prod(torch.log(gamma)) != 1:
+        #     print('fuck1')
+        #     # My way of gamma
+        #     gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
+        #     gamma_j = gamma[idx]
+        #     gamma_mean = (gamma_i + gamma_j)/2
+            
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
 
-        elong = self.elong_func_cos(q_mean, dx)                      # cos(2theta) or linear from theta?
+        #     elong = self.elong_func_cos(q_mean, dx)                      # cos(2theta) or linear from theta?
 
-        exponent = gamma_mean * elong
-        exponent[wall_mask] = 0.0
+        #     exponent = gamma_mean * elong
+        #     exponent[wall_mask] = 0.0
 
-        d_tilde = d * torch.exp(exponent)
+        #     d_tilde = d * torch.exp(exponent)
+        # else:
+        d_tilde = d
 
         # Schums way of gamma
         # with torch.no_grad():
