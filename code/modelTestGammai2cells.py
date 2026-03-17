@@ -37,7 +37,7 @@ class Simulation:
         self.min_batch_size = 512
 
         # Model parameters
-        self.k              = 12                            # Number of nearest neighbors to consider
+        self.k              = 2                            # Number of nearest neighbors to consider
         self.true_neighbour_max     = 50                    # Maximum number of true neighbors in former timestep
         self.dt             = sim_dict['dt']                # Size of timestep for simulation
         self.sqrt_dt        = np.sqrt(self.dt)              # Square root of time step. We calculate it here instead of in the update loop
@@ -118,6 +118,8 @@ class Simulation:
         self.alpha_range = torch.tensor([-sim_dict['alpha_range'] * np.pi/180.0, sim_dict['alpha_range'] * np.pi/180.0 ], device=self.device, dtype=self.dtype)
         self.gamma_range = torch.tensor([-np.log(sim_dict['gamma_range']), np.log(sim_dict['gamma_range']) ], device=self.device, dtype=self.dtype)
 
+        # For model setup
+        self.gamma_mean_bool = sim_dict['gamma_mean_bool']
 
         # Set random seed
         torch.manual_seed(self.random_seed)                 # For reproducibility
@@ -174,11 +176,28 @@ class Simulation:
             # cKD-tree method
             x_cpu = x.cpu().numpy()
             tree = cKDTree(x_cpu)
-            d, idx = tree.query(x_cpu, k=k+1)  # Get the k+1 nearest neighbors (including self)
+            # Ensure k+1 doesn't exceed number of cells
+            n_cells = x_cpu.shape[0]
+            k_query = min(k + 1, n_cells)
+            d, idx = tree.query(x_cpu, k=k_query)  # Get the k+1 nearest neighbors (including self), or all if fewer cells
             d = torch.from_numpy(d).to(x.device).to(x.dtype)
             idx = torch.from_numpy(idx).to(x.device).long()
+            
+            # Handle 1D case (when k_query == 1, only self is returned)
+            if k_query == 1:
+                # For single-cell query, expand dimensions
+                d = d.unsqueeze(1)
+                idx = idx.unsqueeze(1)
+            elif d.ndim == 1:
+                # Convert 1D arrays to 2D if needed
+                d = d.unsqueeze(1)
+                idx = idx.unsqueeze(1)
 
-        return d[:, 1:], idx[:, 1:]                             # Return distances and indices of neighbors. Note that we do not return the self-neighbor
+        if d.shape[1] > 1:
+            return d[:, 1:], idx[:, 1:]  # Return distances and indices of neighbors, excluding self-neighbor
+        else:
+            # For 2-cell system, return only the single other cell
+            return d[:, :1], idx[:, :1]
 
     def find_max_safe_batch(self, total_cells):
 
@@ -543,13 +562,24 @@ class Simulation:
         # My way of gamma
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
-        gamma_mean = (gamma_i + gamma_j)/2
+
+        if self.gamma_mean_bool:
+            gamma_i_exp = torch.exp(gamma_i)
+            gamma_j_exp = torch.exp(gamma_j)
+            gamma_mean = (gamma_i_exp + gamma_j_exp)/2 
+            gamma_mean = torch.log(gamma_mean)
+            # gamma_mean = (gamma_i + gamma_j)/2
+        else:
+            gamma_mean = gamma_i
         
         # elong = self.elong_func_cos(q_mean, dx)                      # cos(2theta) or linear from theta?        
         elong = self.elong_func_linear(q_mean, dx)                      # cos(2theta) or linear from theta?        
 
         exponent = gamma_mean * elong
         exponent[wall_mask] = 0.0
+
+        if self.tstep % 1_000 == 0:
+            print("d", d)
 
         d_tilde = d * torch.exp(exponent)
 
@@ -570,7 +600,7 @@ class Simulation:
         S = l[:,:,0] + l[:,:,1] * S1 + l[:,:,2] * S2 + l[:,:,3] * S3
 
         Vij = z_mask.float() * S * (torch.exp(-d_tilde) - torch.exp(-d_tilde/5))        # Calculating the potential energy between particles masking out false interactions via voronoi_mask
-        
+
         # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
         # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
 
@@ -587,15 +617,17 @@ class Simulation:
             Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val
         
         Vij_sum = torch.sum(Vij)
-        Vij_sum += torch.abs(gamma).sum() * 1/50
 
-        if self.tstep > 1_000:
-            # Boundary conditions          
-            bc = self.bound(x)
-            stretch = self.radial_stretch(x, p_mask)
-        else:
-            bc = 0.0
-            stretch = 0.0
+        # Vij_sum += torch.abs(gamma).sum() * 1/50
+
+        # if self.tstep > 1_000:
+        #     # Boundary conditions          
+        #     bc = self.bound(x)
+        #     stretch = self.radial_stretch(x, p_mask)
+        # else:
+
+        bc = 0.0
+        stretch = 0.0
 
         V = Vij_sum + bc + stretch
 
@@ -603,6 +635,8 @@ class Simulation:
         Vij_normed = Vij / num_neighbors[:, None]       
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
+
+
 
         return V , Vi
 
@@ -675,17 +709,9 @@ class Simulation:
             p_mask (torch.Tensor or None): The updated particle mask.
         """
 
-        # Update proliferation rate from when we want cell proliferation to occur
-        if tstep == (self.prolif_delay + 1) and self.prolif_rate is not None:
-            if torch.unique(p_mask).shape[0] > 1:        # If we have multiple cell types
-                self.beta[p_mask == 0] = self.prolif_rate[0]
-                self.beta[p_mask == 1] = self.prolif_rate[1]
-            else:
-                self.beta[:] = self.prolif_rate
-
-        # Start with cell division
-        self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
-        self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
+        # For 2-cell simulations, disable cell division and apoptosis to maintain exact 2 cells
+        self.division = False
+        self.apoptosis = False
 
         # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
         # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
@@ -702,8 +728,8 @@ class Simulation:
         with torch.no_grad():
             for i,eta in enumerate(self.eta_lst):
                 x[p_mask == i] += -x.grad[p_mask == i] * self.dt + eta * torch.empty(*x[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
-                p[p_mask == i] += -p.grad[p_mask == i] * self.dt + eta * torch.empty(*p[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
-                q[p_mask == i] += -q.grad[p_mask == i] * self.dt + eta * torch.empty(*q[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                # p[p_mask == i] += -p.grad[p_mask == i] * self.dt + eta * torch.empty(*p[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                # q[p_mask == i] += -q.grad[p_mask == i] * self.dt + eta * torch.empty(*q[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
 
                 # Updating alpha and gamma if they are free
                 if self.alpha_par_bool_lst[i]:
@@ -1165,73 +1191,36 @@ def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_param
     sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
     return sphere_data
 
-def make_sphere_surface_stretch(N, stretch_frac, mirrored=True, 
-                               radius=30, alpha_params=None, gamma_params=None):
-    """
-    Generates cells uniformly distributed on a sphere 
-    with abp polarities pointing radially outward and randomly initialized pcp polarities.
+def make_two_particles_on_string(parallel=False, alpha_params=None, gamma_params=None):
+    """Create a simulation with exactly 2 cells for testing."""
+    # Create 2 particles on a 1D string
+    x = np.array([[-1, 0, 0], [1, 0, 0]])
+    p = np.array([[0, 1, 0], [0, 1, 0]])
+    q = np.array([[0, 0, 1], [0, 0, 1]])
+    mask = np.array([0, 1])  # Two different cell types for testing
 
-    Parameters
-        N (int): The number of cells to generate.
-        stretch_frac (float): The fraction of cells that will be stretched.
-        mirrored (bool): Whether to stretch to both sides or only 1.
-        radius (float): The radius of the sphere.
+    alpha_par = np.zeros(2)
+    alpha_perp = np.zeros(2)
+    gamma = np.zeros(2)
 
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-    """
-
-    # Generate random positions on a sphere
-    x = np.random.randn(N, 3)
-    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
-    x *= radius
-
-    # Generate apicobasal polarities pointing radially outward
-    p = x / np.linalg.norm(x, axis=1)[:, None]
-
-    # Generate random planar cell polarities
-    q = np.random.randn(N, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate cell types based on distance from the center
-    mask = np.zeros(N, dtype=int)
-    # All cells in the stretch_frace fraction of the radius from the center are type 1
-    # Sorting cells by their distance from the center
-    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-    if mirrored:
-        mask[sorted_indices[:int(N*stretch_frac/2)]] = 1
-        mask[sorted_indices[int(N*(1-stretch_frac/2)):]] = 1
-    else:
-        mask[sorted_indices[:int(N*stretch_frac)]] = 1
-
-    alpha_par = np.zeros(N)
-    alpha_perp = np.zeros(N)
-    gamma = np.zeros(N)
-
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    # Check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
     if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+        assert isinstance(alpha_params[0], list), "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list), "Expected gamma_params to be a list for multiple cell types"
 
         # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+        alpha_par[mask == 0] = alpha_params[0][0][0] * np.pi / 180.0
+        alpha_perp[mask == 0] = alpha_params[0][1][0] * np.pi / 180.0
+        alpha_par[mask == 1] = alpha_params[1][0][0] * np.pi / 180.0
+        alpha_perp[mask == 1] = alpha_params[1][1][0] * np.pi / 180.0
 
         # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]        = np.log(gamma_params[1][0])
+        gamma[mask == 0] = np.log(gamma_params[0][0])
+        gamma[mask == 1] = np.log(gamma_params[1][0])
     else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
+        alpha_par[:] = alpha_params[0][0] * np.pi / 180.0
+        alpha_perp[:] = alpha_params[1][0] * np.pi / 180.0
+        gamma[:] = np.log(gamma_params[0])
 
-
-    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    return sphere_data
+    two_cell_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return two_cell_data

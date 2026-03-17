@@ -937,6 +937,17 @@ class DataVizGUI(QMainWindow):
         color_layout.addLayout(scalar_row)
         layout.addWidget(color_group)
 
+        # Colorbar
+        self.colorbar_group = QGroupBox("Color Scale")
+        cb_vlay = QVBoxLayout(self.colorbar_group)
+        cb_vlay.setContentsMargins(4, 4, 4, 4)
+        self.colorbar_label = QLabel()
+        self.colorbar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.colorbar_label.setMinimumHeight(120)
+        cb_vlay.addWidget(self.colorbar_label)
+        self.colorbar_group.setVisible(False)
+        layout.addWidget(self.colorbar_group)
+
         # Polarity
         pol_group = QGroupBox("Polarity Vectors")
         pol_layout = QHBoxLayout(pol_group)
@@ -1224,6 +1235,7 @@ class DataVizGUI(QMainWindow):
         self.ts_spinbox.setValue(0)
         self._populate_type_list()
         self._update_info_browser()
+        self._update_colorbar_widget()
         self._refresh()
 
         # Load optional metadata
@@ -1361,12 +1373,75 @@ class DataVizGUI(QMainWindow):
 
     def _on_color_mode_changed(self, btn):
         self.color_mode = btn.property("color_mode")
+        self._update_colorbar_widget()
         self._refresh()
 
     def _on_scalar_key_changed(self, text: str):
         self.scalar_key = text
         if self.color_mode == "scalar":
+            self._update_colorbar_widget()
             self._refresh()
+
+    # ------------------------------------------------------------------
+    # Colorbar rendering
+    # ------------------------------------------------------------------
+    def _render_colorbar_pixmap(self, key: str, vmin: float, vmax: float):
+        """Render a horizontal colorbar as a QPixmap using matplotlib."""
+        from PyQt6.QtGui import QPixmap, QImage
+        import matplotlib.colors as mcolors
+
+        # Build a ListedColormap matching the 3-point scalar_to_rgba gradient
+        n = 256
+        t = np.linspace(0.0, 1.0, n)
+        rgb = np.ones((n, 3), dtype=np.float32)
+        lo = t < 0.5
+        t_lo = t[lo] * 2.0
+        rgb[lo] = np.outer(1 - t_lo, _COLOR_START) + np.outer(t_lo, _COLOR_MID)
+        hi = ~lo
+        t_hi = (t[hi] - 0.5) * 2.0
+        rgb[hi] = np.outer(1 - t_hi, _COLOR_MID) + np.outer(t_hi, _COLOR_END)
+        cmap = mcolors.ListedColormap(rgb)
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+        # Render with matplotlib
+        dpi = 100
+        fig, ax = plt.subplots(figsize=(3.2, 1.1), dpi=dpi)
+        fig.patch.set_facecolor("#1e1e3a")
+        cb = matplotlib.colorbar.ColorbarBase(
+            ax, cmap=cmap, norm=norm, orientation="horizontal"
+        )
+        cb.set_label(key, color="#e0e0f0", fontsize=10)
+        cb.ax.tick_params(colors="#e0e0f0", labelsize=9)
+        ax.set_facecolor("#1e1e3a")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a2a4a")
+        fig.tight_layout(pad=0.3)
+
+        fig.canvas.draw()
+        buf = fig.canvas.buffer_rgba()
+        w, h = fig.canvas.get_width_height()
+        img = QImage(buf, w, h, QImage.Format.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(img)
+        plt.close(fig)
+        return pixmap
+
+    def _update_colorbar_widget(self):
+        """Show/hide and refresh the colorbar based on current color mode."""
+        if self.color_mode != "scalar" or self.data is None:
+            self.colorbar_group.setVisible(False)
+            return
+        key = self.scalar_key
+        vmin, vmax = self.scalar_ranges.get(key, (-1.0, 1.0))
+        pixmap = self._render_colorbar_pixmap(key, vmin, vmax)
+        self.colorbar_label.setPixmap(
+            pixmap.scaled(
+                self.colorbar_label.width() or pixmap.width(),
+                pixmap.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.colorbar_group.setVisible(True)
 
     def _on_polarity_changed(self, state: int):
         self.show_polarity = bool(state)

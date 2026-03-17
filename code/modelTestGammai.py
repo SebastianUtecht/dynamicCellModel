@@ -37,7 +37,7 @@ class Simulation:
         self.min_batch_size = 512
 
         # Model parameters
-        self.k              = 12                            # Number of nearest neighbors to consider
+        self.k              = 2                            # Number of nearest neighbors to consider
         self.true_neighbour_max     = 50                    # Maximum number of true neighbors in former timestep
         self.dt             = sim_dict['dt']                # Size of timestep for simulation
         self.sqrt_dt        = np.sqrt(self.dt)              # Square root of time step. We calculate it here instead of in the update loop
@@ -543,7 +543,8 @@ class Simulation:
         # My way of gamma
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
-        gamma_mean = (gamma_i + gamma_j)/2
+        # gamma_mean = (gamma_i + gamma_j)/2
+        gamma_mean = gamma_i
         
         # elong = self.elong_func_cos(q_mean, dx)                      # cos(2theta) or linear from theta?        
         elong = self.elong_func_linear(q_mean, dx)                      # cos(2theta) or linear from theta?        
@@ -570,7 +571,7 @@ class Simulation:
         S = l[:,:,0] + l[:,:,1] * S1 + l[:,:,2] * S2 + l[:,:,3] * S3
 
         Vij = z_mask.float() * S * (torch.exp(-d_tilde) - torch.exp(-d_tilde/5))        # Calculating the potential energy between particles masking out false interactions via voronoi_mask
-        
+
         # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
         # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
 
@@ -587,15 +588,17 @@ class Simulation:
             Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val
         
         Vij_sum = torch.sum(Vij)
-        Vij_sum += torch.abs(gamma).sum() * 1/50
+        
+        # Vij_sum += torch.abs(gamma).sum() * 1/50
 
-        if self.tstep > 1_000:
-            # Boundary conditions          
-            bc = self.bound(x)
-            stretch = self.radial_stretch(x, p_mask)
-        else:
-            bc = 0.0
-            stretch = 0.0
+        # if self.tstep > 1_000:
+        #     # Boundary conditions          
+        #     bc = self.bound(x)
+        #     stretch = self.radial_stretch(x, p_mask)
+        # else:
+
+        bc = 0.0
+        stretch = 0.0
 
         V = Vij_sum + bc + stretch
 
@@ -603,6 +606,8 @@ class Simulation:
         Vij_normed = Vij / num_neighbors[:, None]       
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
+
+
 
         return V , Vi
 
@@ -702,9 +707,8 @@ class Simulation:
         with torch.no_grad():
             for i,eta in enumerate(self.eta_lst):
                 x[p_mask == i] += -x.grad[p_mask == i] * self.dt + eta * torch.empty(*x[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
-                p[p_mask == i] += -p.grad[p_mask == i] * self.dt + eta * torch.empty(*p[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
-                q[p_mask == i] += -q.grad[p_mask == i] * self.dt + eta * torch.empty(*q[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
-
+                # p[p_mask == i] += -p.grad[p_mask == i] * self.dt + eta * torch.empty(*p[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                # q[p_mask == i] += -q.grad[p_mask == i] * self.dt + eta * torch.empty(*q[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
                 # Updating alpha and gamma if they are free
                 if self.alpha_par_bool_lst[i]:
                     alpha_par[p_mask == i] += -alpha_par.grad[p_mask == i] * self.dt + eta * torch.empty(*alpha_par[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
@@ -1165,52 +1169,86 @@ def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_param
     sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
     return sphere_data
 
-def make_sphere_surface_stretch(N, stretch_frac, mirrored=True, 
-                               radius=30, alpha_params=None, gamma_params=None):
-    """
-    Generates cells uniformly distributed on a sphere 
-    with abp polarities pointing radially outward and randomly initialized pcp polarities.
+def make_three_particles_on_string(parallel=False,alpha_params=None, gamma_params=None):
+    
 
-    Parameters
-        N (int): The number of cells to generate.
-        stretch_frac (float): The fraction of cells that will be stretched.
-        mirrored (bool): Whether to stretch to both sides or only 1.
-        radius (float): The radius of the sphere.
+    x = np.array([[-2,0,0], [0,0,0], [2,0,0]])
+    p = np.array([[0,1,0], [0,1,0], [0,1,0]])
+    q = np.array([[0,0,1], [0,0,1], [0,0,1]])
+    mask = np.array([0,1,0])                #Mask detailing which cells are which type
 
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-    """
+    alpha_par = np.zeros(3)
+    alpha_perp = np.zeros(3)
+    gamma = np.zeros(3)
 
-    # Generate random positions on a sphere
-    x = np.random.randn(N, 3)
-    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
-    x *= radius
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
 
-    # Generate apicobasal polarities pointing radially outward
-    p = x / np.linalg.norm(x, axis=1)[:, None]
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
 
-    # Generate random planar cell polarities
-    q = np.random.randn(N, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate cell types based on distance from the center
-    mask = np.zeros(N, dtype=int)
-    # All cells in the stretch_frace fraction of the radius from the center are type 1
-    # Sorting cells by their distance from the center
-    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-    if mirrored:
-        mask[sorted_indices[:int(N*stretch_frac/2)]] = 1
-        mask[sorted_indices[int(N*(1-stretch_frac/2)):]] = 1
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]        = np.log(gamma_params[1][0])
     else:
-        mask[sorted_indices[:int(N*stretch_frac)]] = 1
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
 
-    alpha_par = np.zeros(N)
-    alpha_perp = np.zeros(N)
-    gamma = np.zeros(N)
+
+    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return sphere_data
+
+def make_8_particles_in_plane(parallel=False,alpha_params=None, gamma_params=None):
+    x = np.array([[0,0,0], [0,2,0], [-2,2,0], [-2,0,0], [2,0,0], [2,2,0], [4,0,0], [4,2,0]])
+    p = np.array([[0,1,0]]*8)
+    q = np.array([[0,0,1]]*8)
+    mask = np.array([0,0,0,0,1,1,1,1])                #Mask detailing which cells are which type
+
+    alpha_par = np.zeros(8)
+    alpha_perp = np.zeros(8)
+    gamma = np.zeros(8)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]        = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+
+    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return sphere_data
+
+def make_3_times_3_square(parallel=False,alpha_params=None, gamma_params=None):
+    x = np.array([[0,0,0], [0,2,0], [0,4,0], [2,0,0], [2,2,0], [2,4,0], [4,0,0], [4,2,0], [4,4,0]])
+    p = np.array([[0,1,0]]*9)
+    q = np.array([[0,0,1]]*9)
+    mask = np.array([0]*9)                #Mask detailing which cells are which type
+    mask[4] = 1
+
+    alpha_par = np.zeros(9)
+    alpha_perp = np.zeros(9)
+    gamma = np.zeros(9)
 
     # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
     if np.unique(mask).size > 1:

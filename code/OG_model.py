@@ -615,3 +615,40 @@ def make_random_sphere(N, type0_frac , radius=35):
 
     sphere_data = (mask, x, p, q)
     return sphere_data      # Returning the goods.
+
+def make_random_sphere_surface(N, type0_frac , radius=30):
+    """
+    Generates cells uniformly distributed on a sphere 
+    with abp polarities pointing radially outward and randomly initialized pcp polarities.
+
+    Parameters
+        N (int): The number of cells to generate.
+        type0_frac (float): The fraction of cells of type 0.
+        radius (float): The radius of the sphere.
+
+    Returns
+        tuple: A tuple containing the following elements:
+            - mask (np.ndarray): The mask indicating the type of each cell.
+            - x (np.ndarray): The positions of the cells.
+            - p (np.ndarray): The apicobasal polarities of the cells.
+            - q (np.ndarray): The planar cell polarities of the cells
+    """
+
+    # Generate random positions on a sphere
+    x = np.random.randn(N, 3)
+    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
+    x *= radius
+
+    # Generate apicobasal polarities pointing radially outward
+    p = x / np.linalg.norm(x, axis=1)[:, None]
+
+    # Generate random planar cell polarities
+    q = np.random.randn(N, 3)
+    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+
+    # Generate random cell types with specified fractions
+    mask = np.random.choice([0,1], p=[type0_frac, 1-type0_frac], size=N)                #Mask detailing which cells are which typ
+
+    sphere_data = (mask, x, p, q)
+
+    return sphere_data
