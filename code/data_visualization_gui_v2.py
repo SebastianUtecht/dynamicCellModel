@@ -728,7 +728,7 @@ class DataVizGUI(QMainWindow):
     data: dict | None           # loaded data dict
     current_timestep: int
     color_mode: str             # "type" | "depth" | "scalar"
-    scalar_key: str             # one of SCALAR_KEYS
+    scalar_key: str             # one of scalar_keys
     scalar_ranges: dict         # {key: (min, max)}
     cell_size: float
     show_polarity: bool
@@ -742,8 +742,7 @@ class DataVizGUI(QMainWindow):
     visible_types: set
     cell_type_colors: dict
     neighbor_search_enabled: bool
-
-    SCALAR_KEYS = ("alpha_par", "alpha_perp", "gamma", "energy")
+    scalar_keys: list           # dynamically detected scalar keys
 
     def __init__(self):
         super().__init__()
@@ -767,8 +766,9 @@ class DataVizGUI(QMainWindow):
         self.play_speed = 100
 
         self.color_mode = "type"
-        self.scalar_key = "alpha_par"
-        self.scalar_ranges = {k: (-1.0, 1.0) for k in self.SCALAR_KEYS}
+        self.scalar_key = ""
+        self.scalar_keys = []
+        self.scalar_ranges = {}
         self.cell_size = 2.0
         self.show_polarity = False
         self.polarity_type = "p"
@@ -930,8 +930,6 @@ class DataVizGUI(QMainWindow):
         scalar_row = QHBoxLayout()
         scalar_row.addWidget(QLabel("  Scalar field:"))
         self.scalar_combo = QComboBox()
-        for k in self.SCALAR_KEYS:
-            self.scalar_combo.addItem(k)
         self.scalar_combo.currentTextChanged.connect(self._on_scalar_key_changed)
         scalar_row.addWidget(self.scalar_combo)
         color_layout.addLayout(scalar_row)
@@ -1204,12 +1202,14 @@ class DataVizGUI(QMainWindow):
         self.max_timesteps = len(raw["x"])
         self.current_timestep = 0
 
-        # Compute scalar ranges
-        for key in self.SCALAR_KEYS:
+        # Detect scalar keys and compute their ranges
+        self.scalar_keys = self._detect_scalar_keys(raw)
+        self.scalar_ranges = {}
+        for key in self.scalar_keys:
             if key in raw and raw[key]:
                 try:
                     all_vals = np.concatenate([v for v in raw[key] if v is not None])
-                    self.scalar_ranges[key] = (float(all_vals.min()), float(all_vals.max()))
+                    self.scalar_ranges[key] = (float(np.min(all_vals)), float(np.max(all_vals)))
                 except Exception as e:
                     print(f"Could not compute range for {key}: {e}")
 
@@ -1234,6 +1234,7 @@ class DataVizGUI(QMainWindow):
         self.ts_slider.setValue(0)
         self.ts_spinbox.setValue(0)
         self._populate_type_list()
+        self._populate_scalar_combo()
         self._update_info_browser()
         self._update_colorbar_widget()
         self._refresh()
@@ -1247,6 +1248,44 @@ class DataVizGUI(QMainWindow):
                 self._update_info_browser()
             except Exception as e:
                 print(f"Could not load sim_dict.json: {e}")
+
+    def _detect_scalar_keys(self, data: dict) -> list:
+        """Detect 1D scalar arrays in the data dict.
+        Returns list of keys that have 1D arrays at each timestep (excluding known non-scalars).
+        """
+        excluded = {"x", "p_mask", "p", "q"}  # Known non-scalar keys
+        scalar_keys = []
+        
+        for key in data:
+            if key in excluded:
+                continue
+            values = data[key]
+            if not values or len(values) == 0:
+                continue
+            # Check first non-None entry
+            first_val = next((v for v in values if v is not None), None)
+            if first_val is None:
+                continue
+            # Verify it's a 1D array-like with length matching cells
+            try:
+                arr = np.asarray(first_val)
+                if arr.ndim == 1:
+                    scalar_keys.append(key)
+            except Exception:
+                pass
+        
+        return sorted(scalar_keys)
+
+    def _populate_scalar_combo(self):
+        """Populate the scalar field dropdown based on detected scalar keys."""
+        self.scalar_combo.blockSignals(True)
+        self.scalar_combo.clear()
+        for key in self.scalar_keys:
+            self.scalar_combo.addItem(key)
+        if self.scalar_keys:
+            self.scalar_key = self.scalar_keys[0]
+            self.scalar_combo.setCurrentText(self.scalar_key)
+        self.scalar_combo.blockSignals(False)
 
     def _generate_type_colors(self):
         cmap = plt.get_cmap("Set1")
@@ -1297,10 +1336,12 @@ class DataVizGUI(QMainWindow):
             lines.append(f"Timesteps: {self.max_timesteps}")
             if "x" in self.data and self.data["x"]:
                 lines.append(f"Cells/step: {len(self.data['x'][0])}")
-            for k in self.SCALAR_KEYS:
-                if k in self.data:
-                    lo, hi = self.scalar_ranges[k]
-                    lines.append(f"{k}: [{lo:.3f}, {hi:.3f}]")
+            if self.scalar_keys:
+                lines.append(f"Scalars: {', '.join(self.scalar_keys)}")
+                for k in self.scalar_keys:
+                    if k in self.scalar_ranges:
+                        lo, hi = self.scalar_ranges[k]
+                        lines.append(f"  {k}: [{lo:.3f}, {hi:.3f}]")
         if self.sim_dict:
             lines.append("---")
             for k, v in list(self.sim_dict.items())[:15]:
