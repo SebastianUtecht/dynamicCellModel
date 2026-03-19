@@ -140,7 +140,7 @@ class Simulation:
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
     
-    def calculate_area(self, d, dx, q_mean, perp_dir, z_mask):
+    def calculate_area(self, d, dx, q, p, z_mask):
         # Using the formula A = 0.5 * sum(|r_{ij} x r_{ij+1}|) where r_{ij} is the vector from cell i to its j-th neighbor. We can calculate r_{ij} as d * dx, where d is the distance to the neighbor and dx is the normalized displacement vector. We then need to take the cross product of r_{ij} and r_{ij+1} and sum over all neighbors. Finally, we multiply by 0.5 to get the area. 
         # We also need to make sure to order the neighbors in a consistent way, which we can do via the atan2 of the dx vectors           
         # Distance vectors:
@@ -157,9 +157,41 @@ class Simulation:
         # area = 0.166 * torch.sum(torch.linalg.norm(torch.cross(rij[:, :-1], rij[:, 1:], dim=2), dim=2) * z_mask[:, :-1] * z_mask[:, 1:], dim=1)
         # if self.tstep % 500 == 0:
         #     print(area)
+            # tangent basis
+        t1 = q
+        t2 = torch.cross(p, q, dim=1)
+        t2 = t2 / (torch.norm(t2, dim=1, keepdim=True) + 1e-8)
 
-        
-        return area
+        # displacements
+        r = dx * d[..., None]
+
+        # project
+        x = torch.einsum('nmk,nk->nm', r, t1)
+        y = torch.einsum('nmk,nk->nm', r, t2)
+
+        # mask invalid neighbors
+        # large = 1e6
+        # x = x.masked_fill(z_mask, large)
+        # y = y.masked_fill(z_mask, large)
+
+        # angles and ordering
+        angles = torch.atan2(y, x)
+        angles = angles.masked_fill(z_mask, float('inf')) # We want the invalid neighbors to be at the end after sorting, so we set their angle to a very large negative value
+        order = torch.argsort(angles, dim=1)
+
+        x = torch.gather(x, 1, order)
+        y = torch.gather(y, 1, order)
+        valid = ~z_mask.gather(1, order)
+
+        # shoelace
+        x_next = torch.roll(x, -1, dims=1)
+        y_next = torch.roll(y, -1, dims=1)
+        valid_next = torch.roll(valid, -1, dims=1)
+        egde_valid = valid & valid_next
+        cross = (x * y_next - x_next * y) * egde_valid
+
+        A_dual = 0.5 * torch.abs(cross.sum(dim=1))
+        return A_dual / 3.0
 
 
 
@@ -618,7 +650,9 @@ class Simulation:
         Vij_sum = torch.sum(Vij)
 
             # if self.penalize_A:
-        Ai = self.calculate_area(d, dx, q_mean, perp_dir, z_mask)
+        Ai = self.calculate_area(d, dx, q, p, z_mask)
+        if self.tstep % 500 == 0:
+            print(Ai)
             # A_penalty = self.penalize_A * (Ai - self.target_A)**2
             # Vij_sum += A_penalty.sum()
 
@@ -637,7 +671,7 @@ class Simulation:
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
-        return V , Vi
+        return V , Vi, Ai
 
     def init_simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -727,7 +761,7 @@ class Simulation:
         d, dx, idx, z_mask = self.get_neighbors_vor(x, p, q, gamma_par, gamma_perp, k=self.k)
   
         # Calculate potential
-        V, Vi = self.potential(x, p, q, p_mask,
+        V, Vi, Ai = self.potential(x, p, q, p_mask,
                             alpha_par, alpha_perp, gamma_par, gamma_perp,
                             d, dx, idx, z_mask)
 
@@ -776,7 +810,7 @@ class Simulation:
             p /= torch.sqrt(torch.sum(p ** 2, dim=1))[:, None]          # Normalizing p. Only the non-zero polarities are considered.
             q /= torch.sqrt(torch.sum(q ** 2, dim=1))[:, None]          # Normalizing q. Only the non-zero polarities are considered.
 
-        return x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, Vi  #Returning the goods.
+        return x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, Vi, Ai  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -800,7 +834,7 @@ class Simulation:
 
         tstep = 0
         while True:
-            x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, energy = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, tstep)        #Advancing the simulation one timestep
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, energy, area = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, tstep)        #Advancing the simulation one timestep
             
             tstep += 1
             self.tstep = tstep
@@ -824,9 +858,10 @@ class Simulation:
                 gammagamma_perp = gammagamma_perp.to("cpu").numpy()
 
                 energy = energy.detach().to("cpu").numpy().copy()
+                area = area.detach().to("cpu").numpy().copy()
                 pp_mask = p_mask.detach().to("cpu").numpy().copy()
                 
-                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma_par, gammagamma_perp, energy                                  # Yielding the data baybeeee
+                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma_par, gammagamma_perp, energy, area                                  # Yielding the data baybeeee
     
     def cell_division(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -1001,18 +1036,22 @@ def save(data_tuple, name, output_folder):
     Saves the simulation data to a pickle file with dict structure.
 
     Parameters:
-        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst)
+        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst)
         name (str): The name of the file (without extension).
         output_folder (str): The folder to save the file in.
 
     Returns:
         None, but saves the data
     """
-    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst = data_tuple
+    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst = data_tuple
 
     energy_lst_copy = energy_lst.copy()
     last_energy = np.zeros_like(p_mask_lst[-1])
     energy_lst_copy.append(last_energy)
+
+    area_lst_copy = area_lst.copy()
+    last_area = np.zeros_like(p_mask_lst[-1])
+    area_lst_copy.append(last_area)
 
     # Structure: query by variable name to get list across all timeframes
     data_dict = {
@@ -1024,7 +1063,8 @@ def save(data_tuple, name, output_folder):
         'alpha_perp': alpha_perp_lst,
         'gamma_par': gamma_par_lst,
         'gamma_perp': gamma_perp_lst,
-        'energy': energy_lst_copy
+        'energy': energy_lst_copy,
+        'area': area_lst_copy
     }
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
@@ -1095,6 +1135,7 @@ def run_simulation(sim_dict):
     gamma_par_lst = [np.exp(gamma_par)]
     gamma_perp_lst = [np.exp(gamma_perp)]
     energy_lst = []
+    area_lst = []
 
     # we make an initial energy
 
@@ -1104,7 +1145,7 @@ def run_simulation(sim_dict):
         json.dump(sim_dict, f, indent = 2)
 
     # Save the initial simulation data
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst), name='data', output_folder=output_folder)
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)
 
     # Print the notes if verbose
     if verbose:
@@ -1116,7 +1157,7 @@ def run_simulation(sim_dict):
     t1 = time() # We timing stuff
 
     # Saving data at intervals specified by yield_every:
-    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gamma_parpar, gamma_perpperp, energyenergy in itertools.islice(runner, yield_steps):
+    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gamma_parpar, gamma_perpperp, energyenergy, areaarea in itertools.islice(runner, yield_steps):
         i += 1
         if verbose:
             print(f'Running {i} of {yield_steps}   ({yield_every * i} of {yield_every * yield_steps})   ({len(xx)} cells)', end='\r')
@@ -1130,19 +1171,20 @@ def run_simulation(sim_dict):
         gamma_par_lst.append(gamma_parpar)
         gamma_perp_lst.append(gamma_perpperp)
         energy_lst.append(energyenergy)
+        area_lst.append(areaarea)
         
         if len(pp_mask) > sim_dict['max_cells']:
             break
         
         # Every 50 yield steps we dump the data
         if i % 50 == 0:
-            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst), name='data', output_folder=output_folder)
+            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)
     
     if verbose:
         print(f'Simulation done, saved {i} datapoints')
         print('Took', time() - t1, 'seconds')
 
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst), name='data', output_folder=output_folder)  # Last iteration is saved
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
 def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
     """
