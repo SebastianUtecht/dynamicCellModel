@@ -140,62 +140,88 @@ class Simulation:
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
     
-    def calculate_area(self, d, dx, q, p, z_mask):
-        # Using the formula A = 0.5 * sum(|r_{ij} x r_{ij+1}|) where r_{ij} is the vector from cell i to its j-th neighbor. We can calculate r_{ij} as d * dx, where d is the distance to the neighbor and dx is the normalized displacement vector. We then need to take the cross product of r_{ij} and r_{ij+1} and sum over all neighbors. Finally, we multiply by 0.5 to get the area. 
-        # We also need to make sure to order the neighbors in a consistent way, which we can do via the atan2 of the dx vectors           
-        # Distance vectors:
-        # rij = d[:,:,None] * dx
-        # # Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean
-        # # Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir    
-        # x =  (q_mean * rij).sum(dim=2)[:,:,None] * q_mean            #torch.matmul(rij, q_mean.transpose(1,2))
-        # y =  (perp_dir * rij).sum(dim=2)[:,:,None] * perp_dir        #torch.matmul(rij, perp_dir.transpose(1,2))
+    def calculate_area(self, d, dx, q, p, z_mask, gamma_par, gamma_perp):
+        # Using the formula A = 0.5 * sum(|r_{ij} x r_{ij+1}|) where r_{ij} is the vector from cell i to its j-th neighbor.
+        # We apply gamma-based elongation to dx before calculating the area, which couples the area penalty to gamma
+        # and ensures gamma equilibrates rather than oscillates.
+        N, m, _ = dx.shape
+        device = dx.device
+        eps = 1e-8
+
+        # # Calculate basis vectors
+        t1 = q                                                # (N, 3)
+        t2 = torch.cross(p, q, dim=1)                         # (N, 3)
+        t2 = t2 / (torch.norm(t2, dim=1, keepdim=True) + eps)
         
-        # angles = torch.atan2(y, x) # We can use any component here, since x and y are parallel to q_mean and perp_dir respectively
-        # sort_idx = torch.argsort(angles, dim=1)
-        # rij = torch.gather(rij, 1, sort_idx[:,:,None].expand(-1, -1, 3))
-        # z_mask = torch.gather(z_mask, 1, sort_idx)
-        # area = 0.166 * torch.sum(torch.linalg.norm(torch.cross(rij[:, :-1], rij[:, 1:], dim=2), dim=2) * z_mask[:, :-1] * z_mask[:, 1:], dim=1)
-        # if self.tstep % 500 == 0:
-        #     print(area)
-            # tangent basis
-        t1 = q
-        t2 = torch.cross(p, q, dim=1)
-        t2 = t2 / (torch.norm(t2, dim=1, keepdim=True) + 1e-8)
+        # # Calculate perpendicular direction
+        # perp_dir = torch.cross(q, p, dim=1)
+        # perp_dir = perp_dir / (torch.norm(perp_dir, dim=1, keepdim=True) + eps)
+        
+        # # Apply gamma-based elongation to displacement vectors
+        # # Decompose dx into parallel and perpendicular components
+        # gamma_par_exp = torch.exp(gamma_par[:, None])  # (N, 1)
+        # gamma_perp_exp = torch.exp(gamma_perp[:, None])  # (N, 1)
+        
+        # # Project dx onto q and perp_dir to get parallel and perpendicular components
+        # dx_par_proj = (q[:, None, :] * dx).sum(dim=2, keepdim=True)  # (N, m, 1)
+        # dx_perp_proj = (perp_dir[:, None, :] * dx).sum(dim=2, keepdim=True)  # (N, m, 1)
+        
+        # # Reconstruct parallel and perpendicular components
+        # dx_par = dx_par_proj * q[:, None, :]  # (N, m, 3)
+        # dx_perp = dx_perp_proj * perp_dir[:, None, :]  # (N, m, 3)
+        
+        # # Get the component orthogonal to both q and perp_dir
+        # dx_other = dx - dx_par - dx_perp  # (N, m, 3)
+        
+        # # Apply elongation factors and reconstruct elongated displacement
+        # dx_elongated = gamma_par_exp[:, :, None] * dx_par + gamma_perp_exp[:, :, None] * dx_perp + dx_other  # (N, m, 3)
+        # dx_elongated = dx
+        
+        # Calculate position vectors using elongated displacements
+        r = d[:, :, None] * dx #* dx_elongated                      # (N, m, 3)
 
-        # displacements
-        r = dx * d[..., None]
+        # Project onto tangent basis
+        x = torch.einsum("nmk,nk->nm", r, t1)                  # (N, m)
+        y = torch.einsum("nmk,nk->nm", r, t2)                  # (N, m)
 
-        # project
-        x = torch.einsum('nmk,nk->nm', r, t1)
-        y = torch.einsum('nmk,nk->nm', r, t2)
+        angles = torch.atan2(y, x)                            # (N, m)
+        angles = angles.masked_fill(~z_mask, float("inf"))
 
-        # mask invalid neighbors
-        # large = 1e6
-        # x = x.masked_fill(z_mask, large)
-        # y = y.masked_fill(z_mask, large)
-
-        # angles and ordering
-        angles = torch.atan2(y, x)
-        angles = angles.masked_fill(z_mask, float('inf')) # We want the invalid neighbors to be at the end after sorting, so we set their angle to a very large negative value
-        order = torch.argsort(angles, dim=1)
+        order = torch.argsort(angles, dim=1)                  # (N, m)
 
         x = torch.gather(x, 1, order)
         y = torch.gather(y, 1, order)
-        valid = ~z_mask.gather(1, order)
+        valid = torch.gather(z_mask, 1, order)        # (N, m)
 
-        # shoelace
-        x_next = torch.roll(x, -1, dims=1)
-        y_next = torch.roll(y, -1, dims=1)
-        valid_next = torch.roll(valid, -1, dims=1)
-        egde_valid = valid & valid_next
-        cross = (x * y_next - x_next * y) * egde_valid
+        x_next = torch.roll(x, shifts=-1, dims=1)
+        y_next = torch.roll(y, shifts=-1, dims=1)
+        valid_next = torch.roll(valid, shifts=-1, dims=1)
 
-        A_dual = 0.5 * torch.abs(cross.sum(dim=1))
-        return A_dual / 3.0
+        edge_valid = valid & valid_next
 
+        cross = (x * y_next - x_next * y) * edge_valid        # (N, m)
+        cross_sum = cross.sum(dim=1)                           # (N,)
 
+        k = valid.sum(dim=1)                                   # (N,)
+        has_polygon = k >= 3
 
+        last = (k - 1).clamp(min=0)                            # (N,)
+        idx = torch.arange(N, device=device)
 
+        x_last = x[idx, last]
+        y_last = y[idx, last]
+        x_first = x[idx, 0]
+        y_first = y[idx, 0]
+
+        closing = x_last * y_first - x_first * y_last
+        closing = closing * has_polygon                        # zero if <3 neighbors
+
+        A_dual = 0.5 * torch.abs(cross_sum + closing)
+
+        # Convert dual area → Voronoi-like area
+        A = A_dual / 3.0
+
+        return A
 
         # CONTINUE HERE. We need correct ordering and only including true neighbors. Furthermore, we should maybe include p and q to get the right basis?
 
@@ -561,8 +587,13 @@ class Simulation:
         pj = p[idx]
         qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
         qj = q[idx]
-        q_mean = (qi + qj)/2
-        p_mean = (pi + pj)/2
+
+        # q_mean = (qi + qj)
+        # q_mean = q_mean / torch.linalg.norm(q_mean, dim=2, keepdim=True)
+        # p_mean = (pi + pj)
+        # p_mean = p_mean / torch.linalg.norm(p_mean, dim=2, keepdim=True)
+        q_mean = qi
+        p_mean = pi
         
         # if torch.sum(torch.abs(alpha_par)) > 0.0001 or torch.sum(torch.abs(alpha_perp)) > 0.0001:  
         
@@ -612,10 +643,21 @@ class Simulation:
         gamma_perp_mean = (gamma_perp_i_exp + gamma_perp_j_exp)/2 
         gamma_perp_mean = torch.log(gamma_perp_mean)
 
-        Z_gamma_par = torch.exp(gamma_par_mean[:,:,None]) * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                          #* dx
+        Z_gamma_par = torch.exp(gamma_par_mean[:,:,None]) * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean
         Z_gamma_perp = torch.exp(gamma_perp_mean[:,:,None]) * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir
         ri_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (dx * p_mean).sum(dim=2)[:,:,None] * p_mean)
         d_tilde = torch.linalg.norm(ri_tilde, dim=2)
+
+        # if self.tstep % 1000 == 0:
+        #     # Check orthonormality
+        #     dot_qp = torch.sum(q_mean * p_mean, dim=2)
+        #     dot_qperp = torch.sum(q_mean * perp_dir, dim=2)
+        #     dot_pperp = torch.sum(p_mean * perp_dir, dim=2)
+        #     print(f"q·p = {dot_qp[0,:5]}")  # Should be ~0
+        #     print(f"q·perp = {dot_qperp[0,:5]}")  # Should be ~0
+        #     print(f"p·perp = {dot_pperp[0,:5]}")  # Should be ~0
+        #     print('mean difference in d_tilde vs d:', torch.mean(torch.abs(d_tilde - d)))
+    
 
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
@@ -649,16 +691,18 @@ class Simulation:
         
         Vij_sum = torch.sum(Vij)
 
-            # if self.penalize_A:
-        Ai = self.calculate_area(d, dx, q, p, z_mask)
-        if self.tstep % 500 == 0:
-            print(Ai)
+        # with torch.no_grad():
+        Ai = self.calculate_area(d, dx, q, p, z_mask, gamma_par, gamma_perp)
+        
+        if self.penalize_A:
             # A_penalty = self.penalize_A * (Ai - self.target_A)**2
-            # Vij_sum += A_penalty.sum()
+            A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
+            Vij_sum += A_penalty.sum()
+
 
         if self.tstep > 1_000:
             # Boundary conditions          
-            bc = self.bound(x)
+            bc = self.bound(x)  
             stretch = self.radial_stretch(x, p_mask)
         else:
             bc = 0.0
