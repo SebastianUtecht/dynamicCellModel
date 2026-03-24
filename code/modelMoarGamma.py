@@ -459,7 +459,7 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
     
-    def symmetrize_neighbors(self, d, dx, idx, z_mask):
+    def symmetrize_neighbors(self,d, dx, idx, z_mask):
         """
         Symmetrize the neighbor lists to ensure that if cell i is a neighbor of cell j, then cell j is also a neighbor of cell i.
 
@@ -476,45 +476,52 @@ class Simulation:
             z_mask_sym (torch.Tensor): Symmetrized boolean mask indicating true neighbors.
         """
         # Create a mapping from (i, neighbor) to (j, neighbor) for symmetrization
-        i_indices = torch.arange(d.shape[0], device=d.device).unsqueeze(1).expand(-1, d.shape[1])
-        j_indices = idx
-        neighbor_pairs = torch.stack((i_indices, j_indices), dim=-1)
 
-        # Create a mapping from (j, neighbor) to (i, neighbor)
-        reverse_pairs = torch.flip(neighbor_pairs, dims=[-1])
+        def masked_symmetric_edges(idx, z_mask, N):
+            device = idx.device
+            m = idx.size(1)
 
-        # Combine original and reverse pairs
-        all_pairs = torch.cat((neighbor_pairs, reverse_pairs), dim=0)
+            # Source indices
+            src = torch.arange(N, device=device).repeat_interleave(m)
+            dst = idx.reshape(-1)
+            msk = z_mask.reshape(-1)
 
-        # Remove duplicates and sort
-        unique_pairs = torch.unique(all_pairs, dim=0)
-        sorted_pairs = unique_pairs[torch.argsort(unique_pairs[:, 0])]
+            # Apply mask
+            src = src[msk]
+            dst = dst[msk]
 
-        # Create new tensors for symmetrized neighbors
-        d_sym = torch.zeros_like(d)
-        dx_sym = torch.zeros_like(dx)
-        idx_sym = torch.zeros_like(idx)
-        z_mask_sym = torch.zeros_like(z_mask)
+            # Add reverse edges
+            src_sym = torch.cat([src, dst])
+            dst_sym = torch.cat([dst, src])
 
-        # Fill in the symmetrized tensors based on the sorted pairs
-        for pair in sorted_pairs:
-            i, j = pair
-            mask_ij = (neighbor_pairs[:, 0] == i) & (neighbor_pairs[:, 1] == j)
-            mask_ji = (neighbor_pairs[:, 0] == j) & (neighbor_pairs[:, 1] == i)
+            edges = torch.stack([src_sym, dst_sym], dim=1)
 
-            if mask_ij.any():
-                d_sym[i] += d[mask_ij].sum()
-                dx_sym[i] += dx[mask_ij].sum(dim=0)
-                idx_sym[i] += idx[mask_ij].sum()
-                z_mask_sym[i] += z_mask[mask_ij].sum()
+            # Optional: remove self-loops
+            edges = edges[edges[:, 0] != edges[:, 1]]
 
-            if mask_ji.any():
-                d_sym[j] += d[mask_ji].sum()
-                dx_sym[j] += dx[mask_ji].sum(dim=0)
-                idx_sym[j] += idx[mask_ji].sum()
-                z_mask_sym[j] += z_mask[mask_ji].sum()
+            # Remove duplicates
+            edges = torch.unique(edges, dim=0)
 
-        return d_sym, dx_sym, idx_sym, z_mask_sym
+            return edges
+
+        def edges_to_neighbors_with_mask(edges, N, pad_value=-1):
+            neighbors = [[] for _ in range(N)]
+
+            for i, j in edges.tolist():
+                neighbors[i].append(j)
+
+            max_deg = max(len(n) for n in neighbors)
+
+            idx_out = torch.full((N, max_deg), pad_value, dtype=torch.long)
+            mask_out = torch.zeros((N, max_deg), dtype=torch.bool)
+
+            for i, n in enumerate(neighbors):
+                if n:
+                    idx_out[i, :len(n)] = torch.tensor(n)
+                    mask_out[i, :len(n)] = True
+
+            return idx_out, mask_out
+        
 
 
 
