@@ -459,6 +459,66 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
     
+    def symmetrize_neighbors(self, d, dx, idx, z_mask):
+        """
+        Symmetrize the neighbor lists to ensure that if cell i is a neighbor of cell j, then cell j is also a neighbor of cell i.
+
+        Parameters:
+            d (torch.Tensor): Distances to neighbors.
+            dx (torch.Tensor): Normalized displacement vectors to neighbors.
+            idx (torch.Tensor): Indices of neighbors.
+            z_mask (torch.Tensor): Boolean mask indicating true neighbors.
+
+        Returns:
+            d_sym (torch.Tensor): Symmetrized distances to neighbors.
+            dx_sym (torch.Tensor): Symmetrized normalized displacement vectors to neighbors.
+            idx_sym (torch.Tensor): Symmetrized indices of neighbors.
+            z_mask_sym (torch.Tensor): Symmetrized boolean mask indicating true neighbors.
+        """
+        # Create a mapping from (i, neighbor) to (j, neighbor) for symmetrization
+        i_indices = torch.arange(d.shape[0], device=d.device).unsqueeze(1).expand(-1, d.shape[1])
+        j_indices = idx
+        neighbor_pairs = torch.stack((i_indices, j_indices), dim=-1)
+
+        # Create a mapping from (j, neighbor) to (i, neighbor)
+        reverse_pairs = torch.flip(neighbor_pairs, dims=[-1])
+
+        # Combine original and reverse pairs
+        all_pairs = torch.cat((neighbor_pairs, reverse_pairs), dim=0)
+
+        # Remove duplicates and sort
+        unique_pairs = torch.unique(all_pairs, dim=0)
+        sorted_pairs = unique_pairs[torch.argsort(unique_pairs[:, 0])]
+
+        # Create new tensors for symmetrized neighbors
+        d_sym = torch.zeros_like(d)
+        dx_sym = torch.zeros_like(dx)
+        idx_sym = torch.zeros_like(idx)
+        z_mask_sym = torch.zeros_like(z_mask)
+
+        # Fill in the symmetrized tensors based on the sorted pairs
+        for pair in sorted_pairs:
+            i, j = pair
+            mask_ij = (neighbor_pairs[:, 0] == i) & (neighbor_pairs[:, 1] == j)
+            mask_ji = (neighbor_pairs[:, 0] == j) & (neighbor_pairs[:, 1] == i)
+
+            if mask_ij.any():
+                d_sym[i] += d[mask_ij].sum()
+                dx_sym[i] += dx[mask_ij].sum(dim=0)
+                idx_sym[i] += idx[mask_ij].sum()
+                z_mask_sym[i] += z_mask[mask_ij].sum()
+
+            if mask_ji.any():
+                d_sym[j] += d[mask_ji].sum()
+                dx_sym[j] += dx[mask_ji].sum(dim=0)
+                idx_sym[j] += idx[mask_ji].sum()
+                z_mask_sym[j] += z_mask[mask_ji].sum()
+
+        return d_sym, dx_sym, idx_sym, z_mask_sym
+
+
+
+    
     def potential(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma, d, dx, idx, z_mask):
         """
         Calculate the potential energy between particles.
@@ -690,6 +750,7 @@ class Simulation:
         # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
         # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
         d, dx, idx, z_mask = self.get_neighbors_vor(x, p, q, gamma, k=self.k)
+        d, dx, idx, z_mask = self.symmetrize_neighbors(d, dx, idx, z_mask)     
   
         # Calculate potential
         V, Vi = self.potential(x, p, q, p_mask,
@@ -942,22 +1003,6 @@ class Simulation:
         return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
     
 
-# def save(data_tuple, name, output_folder):
-#     """
-#     Saves the simulation data to an .npy file.
-
-#     Parameters:
-#         data_tuple (Tuple): (p_mask, x, p, q)
-#         name (str): The name of the file (without extension).
-#         output_folder (str): The folder to save the file in.
-
-#     Returns:
-#         None, but saves the data
-#     """
-
-#     with open(f'{output_folder}/{name}.npy', 'wb') as f:
-#         pickle.dump(data_tuple, f)
-
 def save(data_tuple, name, output_folder):
     """
     Saves the simulation data to a pickle file with dict structure.
@@ -1015,12 +1060,39 @@ def run_simulation(sim_dict):
     if isinstance(data, dict):
         print('Using input data from dictionary')
         p_mask = data['p_mask']
-        x = data['x'][0]
-        p = data['p'][0]
-        q = data['q'][0]
-        alpha_par = data['alpha_par']
-        alpha_perp = data['alpha_perp']
-        gamma = data['gamma']
+        x = data['x']
+        p = data['p']
+        q = data['q']
+
+        alpha_params = sim_dict['alpha_params']
+        gamma_params = sim_dict['gamma_params']
+
+        alpha_par = np.zeros_like(p_mask, dtype=np.float32)
+        alpha_perp = np.zeros_like(p_mask, dtype=np.float32)
+        gamma = np.zeros_like(p_mask, dtype=np.float32)
+
+        if np.unique(p_mask).size > 1:
+            assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+            assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+            # Setting initial alpha values
+            alpha_par[p_mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+            alpha_perp[p_mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+            alpha_par[p_mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+            alpha_perp[p_mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+            # Setting initial gamma values
+            gamma[p_mask == 0]        = np.log(gamma_params[0][0])
+            gamma[p_mask == 1]        = np.log(gamma_params[1][0])
+        else:
+            alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+            alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+            gamma[:]        = np.log(gamma_params[0])
+
+
+        # alpha_par = data['alpha_par']
+        # alpha_perp = data['alpha_perp']
+        # gamma = data['gamma']
 
     elif isinstance(data, tuple):
         # Data generation tuple construction: (data_gen, data_gen_args)

@@ -645,7 +645,7 @@ class Simulation:
 
         Z_gamma_par = torch.exp(gamma_par_mean[:,:,None]) * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean
         Z_gamma_perp = torch.exp(gamma_perp_mean[:,:,None]) * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir
-        ri_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (dx * p_mean).sum(dim=2)[:,:,None] * p_mean)
+        ri_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (p_mean * dx).sum(dim=2)[:,:,None] * p_mean)
         d_tilde = torch.linalg.norm(ri_tilde, dim=2)
 
         # if self.tstep % 1000 == 0:
@@ -1136,13 +1136,44 @@ def run_simulation(sim_dict):
     if isinstance(data, dict):
         print('Using input data from dictionary')
         p_mask = data['p_mask']
-        x = data['x'][0]
-        p = data['p'][0]
-        q = data['q'][0]
-        alpha_par = data['alpha_par']
-        alpha_perp = data['alpha_perp']
-        gamma_par = data['gamma_par']
-        gamma_perp = data['gamma_perp']
+        x = data['x']
+        p = data['p']
+        q = data['q']
+
+        alpha_params = sim_dict['alpha_params']
+        gamma_params = sim_dict['gamma_params']
+
+        alpha_par = np.zeros_like(p_mask, dtype=np.float32)
+        alpha_perp = np.zeros_like(p_mask, dtype=np.float32)
+        gamma_par = np.zeros_like(p_mask, dtype=np.float32)
+        gamma_perp = np.zeros_like(p_mask, dtype=np.float32)
+
+        if np.unique(p_mask).size > 1:
+            assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+            assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+            # Setting initial alpha values
+            alpha_par[p_mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+            alpha_perp[p_mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+            alpha_par[p_mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+            alpha_perp[p_mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+            # Setting initial gamma values
+            gamma_par[p_mask == 0]        = np.log(gamma_params[0][0][0])
+            gamma_perp[p_mask == 0]       = np.log(gamma_params[0][1][0])
+            gamma_par[p_mask == 1]        = np.log(gamma_params[1][0][0])
+            gamma_perp[p_mask == 1]       = np.log(gamma_params[1][1][0])
+        else:
+            alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+            alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+            gamma_par[:]        = np.log(gamma_params[0][0])
+            gamma_perp[:]       = np.log(gamma_params[1][0])
+
+
+        # alpha_par = data['alpha_par'] * np.pi/180.0
+        # alpha_perp = data['alpha_perp'] * np.pi/180.0
+        # gamma_par = np.log(data['gamma_par'])
+        # gamma_perp = np.log(data['gamma_perp'])
 
     elif isinstance(data, tuple):
         # Data generation tuple construction: (data_gen, data_gen_args)
@@ -1369,3 +1400,72 @@ def make_sphere_surface_stretch(N, stretch_frac, mirrored=True,
 
     sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma_par, gamma_perp)
     return sphere_data
+
+def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
+    """
+    Generates cells in the xy-plane with abp polarities pointing in the z-direction and randomly initialized pcp polarities.
+    N is a side so the total number of cells is N^2.
+    Cells are initially placed in a grid 2 units apart.
+    The stretch_frac works as in make_sphere_surface_stretch,
+        stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
+        size (float): The size of the plain.
+
+    Returns
+        tuple: A tuple containing the following elements:
+            - mask (np.ndarray): The mask indicating the type of each cell.
+            - x (np.ndarray): The positions of the cells.
+            - p (np.ndarray): The apicobasal polarities of the cells.
+            - q (np.ndarray): The planar cell polarities of the cells
+            - alpha_par (np.ndarray): The parallel alpha parameter for each cell.
+            - alpha_perp (np.ndarray): The perpendicular alpha parameter for each cell.
+            - gamma_par (np.ndarray): The parallel gamma (elongation) parameter for each cell.
+            - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
+    """
+
+    # Generate grid positions in the xy-plane
+    x = np.array([[i*2, j*2, 0] for i in range(N) for j in range(N)], dtype=float)
+
+    # Generate apicobasal polarities pointing in the z-direction
+    p = np.array([[0, 0, 1] for _ in range(N**2)], dtype=float)
+
+    # Generate random planar cell polarities
+    q = np.random.randn(N**2, 3)
+    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+
+    # Generate cell types based on distance from the center
+    mask = np.zeros(N**2, dtype=int)
+    # All cells in the stretch_frace fraction of the radius from the center are type 1
+    # Sorting cells by their distance from the center
+    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
+    mask[sorted_indices[:int(N**2*stretch_frac)]] = 1
+
+    alpha_par = np.zeros(N**2)
+    alpha_perp = np.zeros(N**2)
+    gamma_par = np.zeros(N**2)
+    gamma_perp = np.zeros(N**2)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma_par[mask == 0]        = np.log(gamma_params[0][0][0])
+        gamma_perp[mask == 0]       = np.log(gamma_params[0][1][0])
+        gamma_par[mask == 1]        = np.log(gamma_params[1][0][0])
+        gamma_perp[mask == 1]       = np.log(gamma_params[1][1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma_par[:]        = np.log(gamma_params[0][0])
+        gamma_perp[:]       = np.log(gamma_params[1][0])
+
+    plain_data = (mask, x, p, q, alpha_par, alpha_perp, gamma_par, gamma_perp)
+    return plain_data

@@ -14,12 +14,19 @@ import vispy
 from vispy import scene
 from vispy.scene import visuals
 
+# Import Voronoi components
+try:
+    from voronoi_animator import VoronoiAnimator
+    VORONOI_AVAILABLE = True
+except ImportError:
+    VORONOI_AVAILABLE = False
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QSlider, QFileDialog,
     QMessageBox, QCheckBox, QScrollArea, QVBoxLayout, QHBoxLayout,
     QTextBrowser, QLabel, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget,
     QListWidgetItem, QSplitter, QProgressDialog, QRadioButton, QButtonGroup,
-    QGroupBox, QTabWidget, QFormLayout, QFrame,
+    QGroupBox, QTabWidget, QFormLayout, QFrame, QDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -372,6 +379,22 @@ class VisPy3DWidget(QWidget):
         self._ghost_visual = None
         self._ghost_pos = None
 
+        # Voronoi visualization
+        self.voronoi_animator = None
+        self.voronoi_mesh_batch = None  # Single batched Mesh visual for all cells
+        self.voronoi_edges_visual = None  # Edges visualization
+        self.voronoi_enabled = False
+        self.voronoi_show_edges = False  # Toggle for edge visualization
+        self.voronoi_edge_color = np.array([1.0, 1.0, 1.0, 1.0])  # White by default
+        self.voronoi_transparency = 0.5
+        # Store for edge rendering
+        self._voronoi_vertices_combined = None
+        self._voronoi_faces_combined = None
+        self._voronoi_boundary_edges = []  # Boundary edges for rendering
+        # Store base colors and face normals for camera-relative lighting
+        self._voronoi_base_vertex_colors = None
+        self._voronoi_face_normals = None
+
         self._init_canvas()
 
     # ------------------------------------------------------------------
@@ -461,6 +484,9 @@ class VisPy3DWidget(QWidget):
             self._ghost_visual.visible = True
         else:
             self._ghost_visual.visible = False
+
+        # Update Voronoi mesh lighting based on camera position
+        self._apply_camera_relative_lighting()
 
     # ------------------------------------------------------------------
     # Camera helpers
@@ -571,19 +597,399 @@ class VisPy3DWidget(QWidget):
         self._highlights.clear()
         self.render()
 
-    # ------------------------------------------------------------------
-    # Main render entry point
-    # ------------------------------------------------------------------
+    def _clear_voronoi_meshes(self):
+        """Remove batched Voronoi mesh visual and edges."""
+        if self.voronoi_mesh_batch is not None:
+            try:
+                self.voronoi_mesh_batch.parent = None
+            except Exception as e:
+                print(f"[clear voronoi batch] {e}")
+            self.voronoi_mesh_batch = None
+
+        if self.voronoi_edges_visual is not None:
+            try:
+                self.voronoi_edges_visual.parent = None
+            except Exception as e:
+                print(f"[clear voronoi edges] {e}")
+            self.voronoi_edges_visual = None
+
+        # Clear stored data
+        self._voronoi_vertices_combined = None
+        self._voronoi_faces_combined = None
+        self._voronoi_boundary_edges = []
+        self._voronoi_base_vertex_colors = None
+        self._voronoi_face_normals = None
+
+    def _add_batched_voronoi_meshes(self, meshes_list, colors=None):
+        """
+        Batch render all Voronoi meshes as a single Mesh visual.
+
+        This combines all per-cell meshes into one visual to reduce draw calls
+        from ~1000 to ~1, dramatically improving performance.
+
+        Parameters
+        ----------
+        meshes_list : list of VoronoiMesh
+            List of Voronoi mesh objects to render
+        colors : list of ndarray, optional
+            List of RGBA colors for each mesh. If None, uses mesh.color
+        """
+        if not meshes_list:
+            self._clear_voronoi_meshes()
+            return
+
+        try:
+            # Concatenate all vertices and adjust face indices
+            all_vertices = []
+            all_faces = []
+            all_boundary_edges = []  # Store boundary edges for each mesh
+            vertex_offset = 0
+
+            for mesh in meshes_list:
+                if mesh.vertices_3d.shape[0] == 0:
+                    continue  # Skip empty meshes
+
+                all_vertices.append(mesh.vertices_3d)
+
+                # Adjust face indices by vertex offset
+                adjusted_faces = mesh.faces + vertex_offset
+                all_faces.append(adjusted_faces)
+
+                # Extract all edges from this individual mesh
+                edges_in_mesh = {}
+                for face in mesh.faces:
+                    edges = [
+                        tuple(sorted([face[0], face[1]])),
+                        tuple(sorted([face[1], face[2]])),
+                        tuple(sorted([face[2], face[0]])),
+                    ]
+                    for edge in edges:
+                        edges_in_mesh[edge] = edges_in_mesh.get(edge, 0) + 1
+
+                # Collect all unique edges from this mesh and adjust indices
+                # Dictionary keys are already unique, each edge appears only once per cell
+                for edge in edges_in_mesh.keys():
+                    adjusted_edge = (edge[0] + vertex_offset, edge[1] + vertex_offset)
+                    all_boundary_edges.append(adjusted_edge)
+
+                vertex_offset += len(mesh.vertices_3d)
+
+            if not all_vertices:  # All meshes are empty
+                self._clear_voronoi_meshes()
+                return
+
+            # Stack into single arrays
+            vertices_combined = np.vstack(all_vertices)
+            faces_combined = np.vstack(all_faces)
+
+            # Create vertex colors array (per-vertex, repeated from per-mesh colors)
+            if colors is not None:
+                vertex_colors = []
+                mesh_idx = 0
+                for mesh in meshes_list:
+                    if mesh.vertices_3d.shape[0] == 0:
+                        continue
+                    mesh_color = colors[mesh_idx] if mesh_idx < len(colors) else np.array([0.5, 0.5, 0.5, 1.0])
+                    vertex_colors.extend([mesh_color] * len(mesh.vertices_3d))
+                    mesh_idx += 1
+                vertex_colors = np.array(vertex_colors, dtype=np.float32)
+            else:
+                vertex_colors = None
+
+            # Clear old mesh if exists
+            self._clear_voronoi_meshes()
+
+            # Store vertices and faces for edge rendering
+            self._voronoi_vertices_combined = vertices_combined
+            self._voronoi_faces_combined = faces_combined
+            self._voronoi_base_vertex_colors = vertex_colors.copy() if vertex_colors is not None else None
+            self._voronoi_boundary_edges = all_boundary_edges  # Store all edges for visualization
+
+            print(f"[batch voronoi] Extracted {len(all_boundary_edges)} edges from {len(meshes_list)} Voronoi cells")
+
+            # Compute face normals for lighting calculations
+            self._voronoi_face_normals = self._compute_face_normals(vertices_combined, faces_combined)
+
+            # Create single batched Mesh visual with flat shading for clean domain appearance
+            # Flat shading means each triangle is uniformly shaded based on its face normal,
+            # avoiding visible triangulation structure within domains
+            self.voronoi_mesh_batch = visuals.Mesh(
+                vertices=vertices_combined,
+                faces=faces_combined,
+                vertex_colors=vertex_colors,
+                shading='flat'  # Flat shading creates faceted appearance without visible triangulation
+            )
+
+            # Add to view
+            self.view.add(self.voronoi_mesh_batch)
+
+            # Edges will be rendered when user toggles them on
+        except Exception as e:
+            print(f"[batch voronoi] Failed to create batched mesh: {e}")
+            import traceback
+            traceback.print_exc()
+            self._clear_voronoi_meshes()
+
+    def _compute_face_normals(self, vertices, faces):
+        """Compute normal vector for each face."""
+        try:
+            face_normals = np.zeros((len(faces), 3), dtype=np.float32)
+            for i, face in enumerate(faces):
+                v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                normal = np.cross(edge1, edge2)
+                norm = np.linalg.norm(normal)
+                if norm > 1e-6:
+                    face_normals[i] = normal / norm
+                else:
+                    face_normals[i] = np.array([0, 0, 1], dtype=np.float32)
+            return face_normals
+        except Exception as e:
+            print(f"[compute face normals] Failed: {e}")
+            return None
+
+    def _compute_smooth_vertex_normals(self, vertices, faces):
+        """Compute smooth vertex normals by averaging adjacent face normals."""
+        try:
+            # Compute face normals
+            face_normals = np.zeros((len(faces), 3), dtype=np.float32)
+            for i, face in enumerate(faces):
+                v0, v1, v2 = vertices[face[0]], vertices[face[1]], vertices[face[2]]
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                normal = np.cross(edge1, edge2)
+                norm = np.linalg.norm(normal)
+                if norm > 1e-6:
+                    face_normals[i] = normal / norm
+                else:
+                    face_normals[i] = np.array([0, 0, 1], dtype=np.float32)
+
+            # Initialize vertex normals
+            vertex_normals = np.zeros_like(vertices)
+
+            # Accumulate face normals to each vertex
+            for face_idx, face in enumerate(faces):
+                for vertex_idx in face:
+                    vertex_normals[vertex_idx] += face_normals[face_idx]
+
+            # Normalize
+            norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+            norms[norms < 1e-6] = 1.0  # Avoid division by zero
+            vertex_normals = vertex_normals / norms
+
+            return vertex_normals
+        except Exception as e:
+            print(f"[compute smooth vertex normals] Failed: {e}")
+            return None
+
+    def _apply_camera_relative_lighting(self):
+        """Apply camera-relative lighting to mesh by adjusting vertex colors."""
+        if (not self.voronoi_enabled or self.voronoi_mesh_batch is None or
+            self._voronoi_base_vertex_colors is None or
+            self._voronoi_vertices_combined is None or
+            self._voronoi_faces_combined is None or
+            self._voronoi_face_normals is None):
+            return
+
+        try:
+            # Get camera position and forward direction
+            cam_pos = self.view.camera.pos
+            cam_forward = self.get_camera_view_direction()
+
+            # Place light behind and above the camera (similar to test_vispy.py's approach)
+            # Position: camera position + offset in view direction and up
+            light_offset = cam_forward * 5 + np.array([2, 2, 2])
+            light_pos = cam_pos + light_offset
+
+            # Compute per-vertex brightness based on face normals and distance to light
+            vertex_brightness = np.ones(len(self._voronoi_vertices_combined), dtype=np.float32)
+
+            for face_idx, face in enumerate(self._voronoi_faces_combined):
+                normal = self._voronoi_face_normals[face_idx]
+
+                # Get face center
+                v0, v1, v2 = (self._voronoi_vertices_combined[face[0]],
+                             self._voronoi_vertices_combined[face[1]],
+                             self._voronoi_vertices_combined[face[2]])
+                face_center = (v0 + v1 + v2) / 3.0
+
+                # Vector from face to light
+                to_light = light_pos - face_center
+                dist = np.linalg.norm(to_light) + 1e-6
+                to_light = to_light / dist
+
+                # Compute two-sided lighting: use absolute value of dot product
+                # so back-facing triangles are also illuminated (represents indirect light)
+                brightness = abs(np.dot(normal, to_light))
+                # Higher ambient term (0.6) for better visibility, lower diffuse (0.4)
+                brightness = 0.6 + 0.4 * brightness
+
+                # Apply to all vertices of this face
+                for vertex_idx in face:
+                    vertex_brightness[vertex_idx] = max(vertex_brightness[vertex_idx], brightness)
+
+            # Apply brightness to base colors
+            lit_colors = self._voronoi_base_vertex_colors.copy()
+            for i in range(len(lit_colors)):
+                lit_colors[i, 0] *= vertex_brightness[i]  # R
+                lit_colors[i, 1] *= vertex_brightness[i]  # G
+                lit_colors[i, 2] *= vertex_brightness[i]  # B
+                # Keep alpha unchanged
+
+            # Update mesh colors
+            if self.voronoi_mesh_batch is not None:
+                self.voronoi_mesh_batch.mesh_data.vertex_colors = lit_colors
+        except Exception as e:
+            pass  # Silent fail for lighting updates
+
+    def _render_voronoi_edges(self, vertices_combined):
+        """
+        Render the edges of the Voronoi cell domains.
+
+        Uses pre-extracted edges from individual cell meshes.
+        """
+        if not self.voronoi_show_edges:
+            if self.voronoi_edges_visual is not None:
+                self.voronoi_edges_visual.parent = None
+                self.voronoi_edges_visual = None
+            return
+
+        try:
+            # Use pre-extracted edges
+            if not hasattr(self, '_voronoi_boundary_edges') or not self._voronoi_boundary_edges:
+                print(f"[render edges] No edges available")
+                return
+
+            edges = self._voronoi_boundary_edges
+
+            # Convert to edge pairs for Line visual
+            edge_positions = []
+            for edge in edges:
+                edge_positions.append([vertices_combined[edge[0]], vertices_combined[edge[1]]])
+
+            if not edge_positions:
+                print(f"[render edges] No edge positions to render")
+                return
+
+            edge_positions = np.array(edge_positions, dtype=np.float32)
+
+            # Remove old edges if they exist
+            if self.voronoi_edges_visual is not None:
+                self.voronoi_edges_visual.parent = None
+
+            # Create new edges visual with better visibility
+            self.voronoi_edges_visual = visuals.Line(
+                pos=edge_positions,
+                color=self.voronoi_edge_color,
+                width=2.5,  # Increased from 1.0 for better visibility
+                connect='segments',
+                antialias=True
+            )
+            # Disable depth test for edges so they appear on top
+            self.voronoi_edges_visual.set_gl_state('translucent', depth_test=False)
+            self.view.add(self.voronoi_edges_visual)
+            print(f"[render edges] Rendered {len(edges)} Voronoi cell edges")
+        except Exception as e:
+            print(f"[render edges] Failed: {e}")
+            import traceback
+            traceback.print_exc()
+            if self.voronoi_edges_visual is not None:
+                self.voronoi_edges_visual.parent = None
+                self.voronoi_edges_visual = None
+
+    def toggle_voronoi_edges(self, show: bool = None):
+        """
+        Toggle Voronoi edge visualization.
+
+        Parameters
+        ----------
+        show : bool, optional
+            If None, toggles current state. Otherwise sets to specified state.
+        """
+        if show is None:
+            self.voronoi_show_edges = not self.voronoi_show_edges
+        else:
+            self.voronoi_show_edges = show
+
+        # Re-render edges if mesh data is available
+        if self._voronoi_vertices_combined is not None:
+            self._render_voronoi_edges(self._voronoi_vertices_combined)
+
+    def set_voronoi_edge_color(self, color: str = "white"):
+        """
+        Set the color of Voronoi edges.
+
+        Parameters
+        ----------
+        color : str
+            Color name: 'white', 'black', 'red', 'green', 'blue', 'yellow', 'cyan', 'magenta'
+        """
+        color_map = {
+            'white': np.array([1.0, 1.0, 1.0, 1.0]),
+            'black': np.array([0.0, 0.0, 0.0, 1.0]),
+            'red': np.array([1.0, 0.0, 0.0, 1.0]),
+            'green': np.array([0.0, 1.0, 0.0, 1.0]),
+            'blue': np.array([0.0, 0.0, 1.0, 1.0]),
+            'yellow': np.array([1.0, 1.0, 0.0, 1.0]),
+            'cyan': np.array([0.0, 1.0, 1.0, 1.0]),
+            'magenta': np.array([1.0, 0.0, 1.0, 1.0]),
+        }
+        if color.lower() in color_map:
+            self.voronoi_edge_color = color_map[color.lower()]
+            # Update edges if they're being shown
+            if self.voronoi_show_edges and self.voronoi_edges_visual is not None:
+                self.voronoi_edges_visual.color = self.voronoi_edge_color
+
+
+
+    def update_voronoi_colors(self):
+        """Update Voronoi mesh colors based on current color mode."""
+        if not self.voronoi_animator or self.gui.current_timestep not in self.voronoi_animator.voronoi_meshes:
+            return
+
+        g = self.gui
+        t = g.current_timestep
+
+        # Update animator colors
+        if g.color_mode == "scalar" and g.scalar_key:
+            key = g.scalar_key
+            if key in g.data and t < len(g.data[key]):
+                scalar_field = g.data[key][t]
+                vmin, vmax = g.scalar_ranges[key]
+                self.voronoi_animator.update_scalar_colors(
+                    t, scalar_field, vmin, vmax,
+                    lambda val, vmin, vmax: scalar_to_rgba(np.array([val]), vmin, vmax)[0]
+                )
+        elif g.color_mode == "type" and "p_mask" in g.data:
+            if t < len(g.data["p_mask"]):
+                p_mask = g.data["p_mask"][t]
+                type_color_map = {
+                    ctype: np.array(g.cell_type_colors.get(ctype, (0.5, 0.5, 0.5, 1.0)), dtype=np.float32)
+                    for ctype in g.unique_types
+                }
+                self.voronoi_animator.update_type_colors(t, p_mask, type_color_map)
+
+        # Update transparency
+        self.voronoi_animator.update_transparency(self.voronoi_transparency)
+
+        # Re-render with new colors
+        self.render()
+
+
     def render(self):
         """Render the current timestep according to gui settings."""
         g = self.gui
+
         if g.data is None:
+            self._clear_cells()  # Ensure cells are cleared even if no data
             return
         t = g.current_timestep
         x = g.data["x"][t]
         p_mask = g.data["p_mask"][t] if "p_mask" in g.data else None
 
         if x is None or len(x) == 0:
+            self._clear_cells()  # Ensure cells are cleared even if no cells
             return
 
         self._clear_cells()
@@ -595,22 +1001,42 @@ class VisPy3DWidget(QWidget):
 
         # Choose color mode
         mode = g.color_mode  # "type" | "depth" | "scalar"
-        if mode == "scalar":
-            key = g.scalar_key
-            raw = g.data[key][t]
-            scalar_f = raw[bool_mask] if raw is not None else None
-            if scalar_f is not None:
-                colors = scalar_to_rgba(scalar_f, g.scalar_ranges[key][0], g.scalar_ranges[key][1])
-                self._add_scatter("scalar", x_f, colors)
+
+        # Check if we should show cell markers (skip if Voronoi enabled and toggle is off)
+        show_cell_markers = True
+        if self.voronoi_enabled:
+            # Only check toggle if Voronoi UI was created (VORONOI_AVAILABLE)
+            if hasattr(self, 'voronoi_show_cells_check'):
+                show_cell_markers = self.voronoi_show_cells_check.isChecked()
             else:
-                self._add_scatter("default", x_f, "green")
-        elif mode == "depth":
-            self._render_depth(x_f)
-        else:  # type or fallback
-            if pm_f is not None and len(g.unique_types) > 0:
-                self._render_by_type(x_f, pm_f)
-            else:
-                self._add_scatter("default", x_f, "green")
+                # If no toggle control exists, hide cells when Voronoi is enabled
+                show_cell_markers = False
+
+        # If not showing markers, ensure they're cleared
+        if not show_cell_markers:
+            for v in self._cell_scatters.values():
+                try:
+                    v.parent = None
+                except:
+                    pass
+            self._cell_scatters.clear()
+        elif show_cell_markers:
+            if mode == "scalar":
+                key = g.scalar_key
+                raw = g.data[key][t]
+                scalar_f = raw[bool_mask] if raw is not None else None
+                if scalar_f is not None:
+                    colors = scalar_to_rgba(scalar_f, g.scalar_ranges[key][0], g.scalar_ranges[key][1])
+                    self._add_scatter("scalar", x_f, colors)
+                else:
+                    self._add_scatter("default", x_f, "green")
+            elif mode == "depth":
+                self._render_depth(x_f)
+            else:  # type or fallback
+                if pm_f is not None and len(g.unique_types) > 0:
+                    self._render_by_type(x_f, pm_f)
+                else:
+                    self._add_scatter("default", x_f, "green")
 
         # Polarity vectors
         if g.show_polarity:
@@ -619,6 +1045,49 @@ class VisPy3DWidget(QWidget):
             if pol_all is not None and len(pol_all) > 0:
                 pol_f = pol_all[bool_mask]
                 self._render_polarity(x_f, pol_f)
+
+        # Voronoi tessellation
+        if self.voronoi_enabled and VORONOI_AVAILABLE and self.voronoi_animator:
+            # Apply current color mode to Voronoi meshes for this frame
+            if t in self.voronoi_animator.voronoi_meshes:
+                if mode == "scalar" and g.scalar_key:
+                    key = g.scalar_key
+                    if key in g.data and t < len(g.data[key]):
+                        scalar_field = g.data[key][t]
+                        vmin, vmax = g.scalar_ranges[key]
+                        self.voronoi_animator.update_scalar_colors(
+                            t, scalar_field, vmin, vmax,
+                            lambda val, vmin, vmax: scalar_to_rgba(np.array([val]), vmin, vmax)[0]
+                        )
+                elif mode == "type" and "p_mask" in g.data and t < len(g.data["p_mask"]):
+                    p_mask = g.data["p_mask"][t]
+                    type_color_map = {
+                        ctype: np.array(g.cell_type_colors.get(ctype, (0.5, 0.5, 0.5, 1.0)), dtype=np.float32)
+                        for ctype in g.unique_types
+                    }
+                    self.voronoi_animator.update_type_colors(t, p_mask, type_color_map)
+
+                # Update transparency
+                self.voronoi_animator.update_transparency(self.voronoi_transparency)
+
+            meshes = self.voronoi_animator.get_visible_meshes(t, bool_mask)
+
+            if meshes:
+                # Collect colors for each mesh
+                colors = []
+                for mesh in meshes:
+                    if mesh.color is not None:
+                        colors.append(mesh.color)
+                    else:
+                        colors.append(np.array([0.5, 0.5, 0.5, 1.0], dtype=np.float32))
+
+                self._add_batched_voronoi_meshes(meshes, colors)
+                # Apply camera-relative lighting
+                self._apply_camera_relative_lighting()
+            else:
+                self._clear_voronoi_meshes()
+        else:
+            self._clear_voronoi_meshes()
 
         # Auto-set camera once
         if not self._camera_bounds_set:
@@ -785,6 +1254,11 @@ class DataVizGUI(QMainWindow):
 
         self.neighbor_search_enabled = False
         self.neighbor_data = {}
+
+        # Voronoi visualization state
+        self.voronoi_enabled = False
+        self.voronoi_transparency = 0.5
+        self.voronoi_force_recalc = False
         self.selected_cell_idx = None
 
     # ------------------------------------------------------------------
@@ -828,6 +1302,11 @@ class DataVizGUI(QMainWindow):
         splitter.setSizes([350, 1050])
 
         root_layout.addWidget(splitter)
+
+        # Disable Voronoi controls until data is loaded
+        if VORONOI_AVAILABLE and hasattr(self, 'voronoi_check'):
+            self.voronoi_check.setEnabled(False)
+            self.voronoi_transparency_slider.setEnabled(False)
 
     # ------------------------------------------------------------------
     # Tab 1: Playback
@@ -970,6 +1449,65 @@ class DataVizGUI(QMainWindow):
         disp_layout.addRow("Background:", self.bg_combo)
         layout.addWidget(disp_group)
 
+        # Voronoi visualization (if available)
+        if VORONOI_AVAILABLE:
+            vor_group = QGroupBox("Voronoi Tessellation")
+            vor_layout = QVBoxLayout(vor_group)
+
+            # Enable/disable toggle
+            self.voronoi_check = QCheckBox("Enable Voronoi Visualization")
+            self.voronoi_check.stateChanged.connect(self._on_voronoi_enabled)
+            vor_layout.addWidget(self.voronoi_check)
+
+            # Transparency slider
+            trans_row = QHBoxLayout()
+            trans_row.addWidget(QLabel("Transparency:"))
+            self.voronoi_transparency_slider = QSlider(Qt.Orientation.Horizontal)
+            self.voronoi_transparency_slider.setMinimum(0)
+            self.voronoi_transparency_slider.setMaximum(100)
+            self.voronoi_transparency_slider.setValue(50)
+            self.voronoi_transparency_label = QLabel("0.50")
+            self.voronoi_transparency_slider.valueChanged.connect(self._on_voronoi_transparency)
+            trans_row.addWidget(self.voronoi_transparency_slider)
+            trans_row.addWidget(self.voronoi_transparency_label)
+            vor_layout.addLayout(trans_row)
+
+            # Show cell markers toggle
+            self.voronoi_show_cells_check = QCheckBox("Show Cell Markers")
+            self.voronoi_show_cells_check.setChecked(True)
+            self.voronoi_show_cells_check.stateChanged.connect(self._on_voronoi_show_cells)
+            vor_layout.addWidget(self.voronoi_show_cells_check)
+
+            # Show edges toggle
+            self.voronoi_edges_check = QCheckBox("Show Voronoi Edges")
+            self.voronoi_edges_check.setChecked(False)
+            self.voronoi_edges_check.stateChanged.connect(self._on_voronoi_edges_toggled)
+            vor_layout.addWidget(self.voronoi_edges_check)
+
+            # Edge color selection
+            edge_color_row = QHBoxLayout()
+            edge_color_row.addWidget(QLabel("Edge Color:"))
+            self.voronoi_edge_color_combo = QComboBox()
+            self.voronoi_edge_color_combo.addItems(["White", "Black", "Red", "Green", "Blue", "Yellow", "Cyan", "Magenta"])
+            self.voronoi_edge_color_combo.currentTextChanged.connect(self._on_voronoi_edge_color_changed)
+            edge_color_row.addWidget(self.voronoi_edge_color_combo)
+            edge_color_row.addStretch()
+            vor_layout.addLayout(edge_color_row)
+
+            # Force recalculation toggle
+            self.voronoi_force_recalc_check = QCheckBox("Force Recalculation (next enable)")
+            self.voronoi_force_recalc_check.setChecked(False)
+            vor_layout.addWidget(self.voronoi_force_recalc_check)
+
+            # Progress bar (hidden by default)
+            self.voronoi_progress = QProgressDialog("Pre-computing Voronoi...", None, 0, 100)
+            self.voronoi_progress.setAutoClose(True)
+            self.voronoi_progress.setAutoReset(True)
+            self.voronoi_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            self.voronoi_progress.setVisible(False)
+
+            layout.addWidget(vor_group)
+
         # Cell types list
         self.type_group = QGroupBox("Cell Types")
         type_layout = QVBoxLayout(self.type_group)
@@ -981,6 +1519,7 @@ class DataVizGUI(QMainWindow):
         layout.addStretch()
         scroll.setWidget(inner)
         self.tabs.addTab(scroll, "Visualization")
+
 
     # ------------------------------------------------------------------
     # Tab 3: Data Sectioning
@@ -1249,6 +1788,22 @@ class DataVizGUI(QMainWindow):
             except Exception as e:
                 print(f"Could not load sim_dict.json: {e}")
 
+        # Try to load cached Voronoi if available
+        if VORONOI_AVAILABLE:
+            try:
+                animator = VoronoiAnimator(self)
+                if animator.load_cache(folder):
+                    self.canvas_widget.voronoi_animator = animator
+                    print(f"[Voronoi] Loaded cache from {folder}")
+            except Exception as e:
+                print(f"[Voronoi] Could not load cache: {e}")
+
+            # Enable Voronoi checkbox now that data is loaded
+            if hasattr(self, 'voronoi_check'):
+                self.voronoi_check.setEnabled(True)
+                self.voronoi_check.setChecked(False)
+                self.voronoi_transparency_slider.setEnabled(True)
+
     def _detect_scalar_keys(self, data: dict) -> list:
         """Detect 1D scalar arrays in the data dict.
         Returns list of keys that have 1D arrays at each timestep (excluding known non-scalars).
@@ -1415,12 +1970,18 @@ class DataVizGUI(QMainWindow):
     def _on_color_mode_changed(self, btn):
         self.color_mode = btn.property("color_mode")
         self._update_colorbar_widget()
+        # Update Voronoi colors when color mode changes
+        if self.canvas_widget.voronoi_animator:
+            self.canvas_widget.update_voronoi_colors()
         self._refresh()
 
     def _on_scalar_key_changed(self, text: str):
         self.scalar_key = text
         if self.color_mode == "scalar":
             self._update_colorbar_widget()
+            # Update Voronoi colors when scalar field changes
+            if self.canvas_widget.voronoi_animator:
+                self.canvas_widget.update_voronoi_colors()
             self._refresh()
 
     # ------------------------------------------------------------------
@@ -1502,6 +2063,209 @@ class DataVizGUI(QMainWindow):
     def _on_bg_changed(self, text: str):
         self.canvas_widget.set_background(text)
         self.canvas_widget.canvas.update()
+
+    def _on_voronoi_enabled(self, state: int):
+        """Handle Voronoi visualization toggle."""
+        if not state:
+            # Disabling Voronoi
+            self.voronoi_enabled = False
+            self.canvas_widget.voronoi_enabled = False
+            self._refresh()
+            return
+
+        # Enabling Voronoi - check if already computed
+        if self.data is None:
+            QMessageBox.warning(self, "Warning", "Please load data first.")
+            self.voronoi_check.setChecked(False)
+            return
+
+        # Check if force recalculation is requested
+        if self.voronoi_force_recalc_check.isChecked():
+            # Clear existing animator to force recalculation
+            self.canvas_widget.voronoi_animator = None
+            self.voronoi_force_recalc_check.setChecked(False)
+            print("[voronoi] Force recalculation enabled - clearing cache")
+
+        # Check if Voronoi is already cached for this data
+        if (self.canvas_widget.voronoi_animator and
+            len(self.canvas_widget.voronoi_animator.voronoi_meshes) > 0):
+            # Voronoi already computed, just enable visualization
+            self.voronoi_enabled = True
+            self.canvas_widget.voronoi_enabled = True
+            self._refresh()
+            return
+
+        # Ask user for timestep range
+        if self.max_timesteps <= 1:
+            start_ts = 0
+            end_ts = self.max_timesteps - 1
+        else:
+            # Create dialog for timestep selection
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select Timestep Range for Voronoi")
+            layout = QVBoxLayout(dialog)
+
+            # Instructions
+            layout.addWidget(QLabel(f"Total timesteps: 0 to {self.max_timesteps - 1}"))
+            layout.addWidget(QLabel("Select range to compute Voronoi for:"))
+
+            # Start timestep
+            start_row = QHBoxLayout()
+            start_row.addWidget(QLabel("Start:"))
+            start_spin = QSpinBox()
+            start_spin.setMinimum(0)
+            start_spin.setMaximum(self.max_timesteps - 1)
+            start_spin.setValue(0)
+            start_row.addWidget(start_spin)
+            layout.addLayout(start_row)
+
+            # End timestep
+            end_row = QHBoxLayout()
+            end_row.addWidget(QLabel("End:"))
+            end_spin = QSpinBox()
+            end_spin.setMinimum(0)
+            end_spin.setMaximum(self.max_timesteps - 1)
+            end_spin.setValue(self.max_timesteps - 1)
+            end_row.addWidget(end_spin)
+            layout.addLayout(end_row)
+
+            # Buttons
+            btn_layout = QHBoxLayout()
+            ok_btn = QPushButton("OK")
+            cancel_btn = QPushButton("Cancel")
+
+            def on_ok():
+                dialog.accept()
+
+            def on_cancel():
+                dialog.reject()
+
+            ok_btn.clicked.connect(on_ok)
+            cancel_btn.clicked.connect(on_cancel)
+            btn_layout.addWidget(ok_btn)
+            btn_layout.addWidget(cancel_btn)
+            layout.addLayout(btn_layout)
+
+            dialog.setLayout(layout)
+
+            # Show dialog
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                start_ts = start_spin.value()
+                end_ts = end_spin.value()
+                if start_ts > end_ts:
+                    start_ts, end_ts = end_ts, start_ts
+            else:
+                # User cancelled
+                self.voronoi_check.setChecked(False)
+                return
+
+        # Start pre-computation for the selected range
+        self.voronoi_enabled = True
+        self.canvas_widget.voronoi_enabled = True
+        self._start_voronoi_precompute(start_ts, end_ts)
+
+    def _on_voronoi_transparency(self, val: int):
+        """Handle Voronoi transparency slider."""
+        alpha = val / 100.0
+        self.voronoi_transparency = alpha
+        self.voronoi_transparency_label.setText(f"{alpha:.2f}")
+        self.canvas_widget.voronoi_transparency = alpha
+        if self.canvas_widget.voronoi_animator:
+            self.canvas_widget.voronoi_animator.update_transparency(alpha)
+            self._refresh()
+
+    def _on_voronoi_show_cells(self, state: int):
+        """Handle show/hide cell markers toggle when Voronoi is active."""
+        show_cells = state == Qt.CheckState.Checked.value
+        # This control is in the GUI, refresh render
+        self._refresh()
+
+    def _on_voronoi_edges_toggled(self, state: int):
+        """Handle Voronoi edges toggle."""
+        show_edges = state == Qt.CheckState.Checked.value
+        self.canvas_widget.toggle_voronoi_edges(show_edges)
+        self.canvas_widget.render()
+
+    def _on_voronoi_edge_color_changed(self, color_name: str):
+        """Handle Voronoi edge color selection."""
+        self.canvas_widget.set_voronoi_edge_color(color_name.lower())
+        self.canvas_widget.render()
+
+    def _start_voronoi_precompute(self, start_ts: int = 0, end_ts: int = None):
+        """
+        Start pre-computing Voronoi tessellations for a range of frames.
+
+        Parameters
+        ----------
+        start_ts : int
+            Starting timestep (inclusive)
+        end_ts : int
+            Ending timestep (inclusive)
+        """
+        if self.data is None or "x" not in self.data or "p" not in self.data:
+            QMessageBox.warning(
+                self, "Warning",
+                "Cannot compute Voronoi: data missing 'x' or 'p' keys."
+            )
+            self.voronoi_check.setChecked(False)
+            return
+
+        if end_ts is None:
+            end_ts = len(self.data["x"]) - 1
+
+        # Validate range
+        start_ts = max(0, start_ts)
+        end_ts = min(len(self.data["x"]) - 1, end_ts)
+
+        if start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
+
+        nframes = end_ts - start_ts + 1
+
+        # Create animator if needed
+        if self.canvas_widget.voronoi_animator is None:
+            self.canvas_widget.voronoi_animator = VoronoiAnimator(self)
+
+        animator = self.canvas_widget.voronoi_animator
+
+        # Show progress dialog
+        self.voronoi_progress.setVisible(True)
+        self.voronoi_progress.setMaximum(nframes)
+        self.voronoi_progress.setValue(0)
+
+        def on_progress(t, n):
+            self.voronoi_progress.setValue(t - start_ts + 1)
+            QApplication.processEvents()
+
+        # Pre-compute
+        try:
+            success = animator.precompute_all_frames(
+                self.data,
+                progress_callback=on_progress,
+                apply_occlusion=False,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            if success:
+                # Save cache
+                animator.save_cache(self.data_folder)
+                QMessageBox.information(
+                    self, "Success",
+                    f"Voronoi pre-computation completed for {nframes} frames ({start_ts}-{end_ts})."
+                )
+            else:
+                QMessageBox.critical(
+                    self, "Error",
+                    "Voronoi pre-computation failed. Check console for details."
+                )
+                self.voronoi_check.setChecked(False)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Voronoi pre-computation error:\n{e}")
+            self.voronoi_check.setChecked(False)
+        finally:
+            self.voronoi_progress.setVisible(False)
+
+        self._refresh()
 
     def _on_type_visibility_changed(self, cell_type, state: int):
         if state:
