@@ -459,69 +459,96 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
     
-    def symmetrize_neighbors(self,d, dx, idx, z_mask):
+    def symmetrize_neighbors(self, d, dx, idx, z_mask, pad_value=-1):
         """
-        Symmetrize the neighbor lists to ensure that if cell i is a neighbor of cell j, then cell j is also a neighbor of cell i.
-
-        Parameters:
-            d (torch.Tensor): Distances to neighbors.
-            dx (torch.Tensor): Normalized displacement vectors to neighbors.
-            idx (torch.Tensor): Indices of neighbors.
-            z_mask (torch.Tensor): Boolean mask indicating true neighbors.
+        idx  : (N, m)    neighbor indices
+        mask : (N, m)    valid neighbor mask
+        d    : (N, m)    distances
+        dx   : (N, m, 3) displacement vectors r_ij = x_j - x_i
 
         Returns:
-            d_sym (torch.Tensor): Symmetrized distances to neighbors.
-            dx_sym (torch.Tensor): Symmetrized normalized displacement vectors to neighbors.
-            idx_sym (torch.Tensor): Symmetrized indices of neighbors.
-            z_mask_sym (torch.Tensor): Symmetrized boolean mask indicating true neighbors.
+        idx_sym  : (N, m_new)
+        mask_sym : (N, m_new)
+        d_sym    : (N, m_new)
+        dx_sym   : (N, m_new, 3)
         """
-        # Create a mapping from (i, neighbor) to (j, neighbor) for symmetrization
 
-        def masked_symmetric_edges(idx, z_mask, N):
-            device = idx.device
-            m = idx.size(1)
+        device = idx.device
+        N, m = idx.shape
 
-            # Source indices
-            src = torch.arange(N, device=device).repeat_interleave(m)
-            dst = idx.reshape(-1)
-            msk = z_mask.reshape(-1)
+        # --------------------------------------------------
+        # 1. Build masked directed edge list with attributes
+        # --------------------------------------------------
+        src = torch.arange(N, device=device).repeat_interleave(m)
+        dst = idx.reshape(-1)
 
-            # Apply mask
-            src = src[msk]
-            dst = dst[msk]
+        mask_flat = z_mask.reshape(-1)
+        d_flat = d.reshape(-1)
+        dx_flat = dx.reshape(-1, 3)
 
-            # Add reverse edges
-            src_sym = torch.cat([src, dst])
-            dst_sym = torch.cat([dst, src])
+        src = src[mask_flat]
+        dst = dst[mask_flat]
+        d_flat = d_flat[mask_flat]
+        dx_flat = dx_flat[mask_flat]
 
-            edges = torch.stack([src_sym, dst_sym], dim=1)
+        # --------------------------------------------------
+        # 2. Add reverse edges (symmetrization)
+        # --------------------------------------------------
+        src_sym = torch.cat([src, dst], dim=0)
+        dst_sym = torch.cat([dst, src], dim=0)
 
-            # Optional: remove self-loops
-            edges = edges[edges[:, 0] != edges[:, 1]]
+        d_sym_e = torch.cat([d_flat, d_flat], dim=0)
+        dx_sym_e = torch.cat([dx_flat, -dx_flat], dim=0)
 
-            # Remove duplicates
-            edges = torch.unique(edges, dim=0)
+        edges = torch.stack([src_sym, dst_sym], dim=1)
 
-            return edges
+        # --------------------------------------------------
+        # 3. Remove self-loops
+        # --------------------------------------------------
+        keep = edges[:, 0] != edges[:, 1]
+        edges = edges[keep]
+        d_sym_e = d_sym_e[keep]
+        dx_sym_e = dx_sym_e[keep]
 
-        def edges_to_neighbors_with_mask(edges, N, pad_value=-1):
-            neighbors = [[] for _ in range(N)]
+        # --------------------------------------------------
+        # 4. Deduplicate edges (keep first occurrence)
+        # --------------------------------------------------
+        edges, unique_idx = torch.unique(
+            edges, dim=0, return_inverse=True, return_counts=False,
+            sorted=False
+        )
 
-            for i, j in edges.tolist():
-                neighbors[i].append(j)
+        d_sym_e = d_sym_e[unique_idx]
+        dx_sym_e = dx_sym_e[unique_idx]
 
-            max_deg = max(len(n) for n in neighbors)
+        # --------------------------------------------------
+        # 5. Rebuild padded (N, m_new) structure
+        # --------------------------------------------------
+        neighbors = [[] for _ in range(N)]
+        distances = [[] for _ in range(N)]
+        displacements = [[] for _ in range(N)]
 
-            idx_out = torch.full((N, max_deg), pad_value, dtype=torch.long)
-            mask_out = torch.zeros((N, max_deg), dtype=torch.bool)
+        for (i, j), dij, dxij in zip(edges.tolist(), d_sym_e, dx_sym_e):
+            neighbors[i].append(j)
+            distances[i].append(dij)
+            displacements[i].append(dxij)
 
-            for i, n in enumerate(neighbors):
-                if n:
-                    idx_out[i, :len(n)] = torch.tensor(n)
-                    mask_out[i, :len(n)] = True
+        m_new = max(len(n) for n in neighbors)
 
-            return idx_out, mask_out
-        
+        idx_out = torch.full((N, m_new), pad_value, dtype=torch.long, device=device)
+        mask_out = torch.zeros((N, m_new), dtype=torch.bool, device=device)
+        d_out = torch.zeros((N, m_new), dtype=d.dtype, device=device)
+        dx_out = torch.zeros((N, m_new, 3), dtype=dx.dtype, device=device)
+
+        for i in range(N):
+            k = len(neighbors[i])
+            if k > 0:
+                idx_out[i, :k] = torch.tensor(neighbors[i], device=device)
+                d_out[i, :k] = torch.stack(distances[i])
+                dx_out[i, :k] = torch.stack(displacements[i])
+                mask_out[i, :k] = True
+
+        return d_out, dx_out, idx_out, mask_out
 
 
 
