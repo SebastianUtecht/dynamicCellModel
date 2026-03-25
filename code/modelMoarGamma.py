@@ -459,7 +459,7 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
     
-    def symmetrize_neighbors(self, d, dx, idx, z_mask, pad_value=-1):
+    def symmetrize_neighbors(self, idx, mask, d, dx, pad_value=-1):
         """
         idx  : (N, m)    neighbor indices
         mask : (N, m)    valid neighbor mask
@@ -482,7 +482,7 @@ class Simulation:
         src = torch.arange(N, device=device).repeat_interleave(m)
         dst = idx.reshape(-1)
 
-        mask_flat = z_mask.reshape(-1)
+        mask_flat = mask.reshape(-1)
         d_flat = d.reshape(-1)
         dx_flat = dx.reshape(-1, 3)
 
@@ -514,8 +514,8 @@ class Simulation:
         # 4. Deduplicate edges (keep first occurrence)
         # --------------------------------------------------
         edges, unique_idx = torch.unique(
-            edges, dim=0, return_inverse=True, return_counts=False,
-            sorted=False
+            edges, dim=0, return_inverse=False, return_counts=False,
+            sorted=False, return_indices=True
         )
 
         d_sym_e = d_sym_e[unique_idx]
@@ -548,7 +548,7 @@ class Simulation:
                 dx_out[i, :k] = torch.stack(displacements[i])
                 mask_out[i, :k] = True
 
-        return d_out, dx_out, idx_out, mask_out
+        return idx_out, mask_out, d_out, dx_out
 
 
 

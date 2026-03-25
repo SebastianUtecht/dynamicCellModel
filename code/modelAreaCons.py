@@ -1343,7 +1343,7 @@ def make_sphere_surface_stretch(N, stretch_frac, mirrored=True,
             - mask (np.ndarray): The mask indicating the type of each cell.
             - x (np.ndarray): The positions of the cells.
             - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
+            - q (np.ndarray): The planar cell polarities of the cellszzzz
     """
 
     # Generate random positions on a sphere
