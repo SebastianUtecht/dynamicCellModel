@@ -317,13 +317,38 @@ _COLOR_START = np.array([0.0, 0.0, 0.3])   # dark purple
 _COLOR_MID   = np.array([1.0, 0.2, 0.0])   # red/orange
 _COLOR_END   = np.array([1.0, 1.0, 0.7])   # light yellow
 
-def scalar_to_rgba(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
-    """Map 1-D scalar array to RGBA using 3-point magma-like colormap."""
-    vrange = vmax - vmin
-    if vrange > 0:
-        norm = np.clip((values - vmin) / vrange, 0.0, 1.0)
+def scalar_to_rgba(values: np.ndarray, vmin: float, vmax: float,
+                   vcenter: float | None = None) -> np.ndarray:
+    """Map 1-D scalar array to RGBA using 3-point magma-like colormap.
+
+    If `vcenter` is provided, uses piecewise normalization so that
+    `vcenter` maps exactly to the midpoint (0.5) of the colormap.
+    """
+    if vcenter is None:
+        vrange = vmax - vmin
+        if vrange > 0:
+            norm = np.clip((values - vmin) / vrange, 0.0, 1.0)
+        else:
+            norm = np.zeros_like(values)
     else:
-        norm = np.zeros_like(values)
+        norm = np.full_like(values, 0.5, dtype=np.float32)
+        lo_mask = values <= vcenter
+        hi_mask = ~lo_mask
+
+        left = vcenter - vmin
+        right = vmax - vcenter
+
+        if left > 1e-12:
+            norm[lo_mask] = 0.5 * (values[lo_mask] - vmin) / left
+        else:
+            norm[lo_mask] = 0.5
+
+        if right > 1e-12:
+            norm[hi_mask] = 0.5 + 0.5 * (values[hi_mask] - vcenter) / right
+        else:
+            norm[hi_mask] = 0.5
+
+        norm = np.clip(norm, 0.0, 1.0)
 
     colors = np.ones((len(values), 4), dtype=np.float32)
     lo = norm < 0.5
@@ -959,7 +984,7 @@ class VisPy3DWidget(QWidget):
                 vmin, vmax = g.scalar_ranges[key]
                 self.voronoi_animator.update_scalar_colors(
                     t, scalar_field, vmin, vmax,
-                    lambda val, vmin, vmax: scalar_to_rgba(np.array([val]), vmin, vmax)[0]
+                    lambda val, vmin, vmax, _g=g, _key=key: _g._scalar_single_color(_key, val, vmin, vmax)
                 )
         elif g.color_mode == "type" and "p_mask" in g.data:
             if t < len(g.data["p_mask"]):
@@ -1026,7 +1051,7 @@ class VisPy3DWidget(QWidget):
                 raw = g.data[key][t]
                 scalar_f = raw[bool_mask] if raw is not None else None
                 if scalar_f is not None:
-                    colors = scalar_to_rgba(scalar_f, g.scalar_ranges[key][0], g.scalar_ranges[key][1])
+                    colors = g._scalar_colors(key, scalar_f)
                     self._add_scatter("scalar", x_f, colors)
                 else:
                     self._add_scatter("default", x_f, "green")
@@ -1057,7 +1082,7 @@ class VisPy3DWidget(QWidget):
                         vmin, vmax = g.scalar_ranges[key]
                         self.voronoi_animator.update_scalar_colors(
                             t, scalar_field, vmin, vmax,
-                            lambda val, vmin, vmax: scalar_to_rgba(np.array([val]), vmin, vmax)[0]
+                            lambda val, vmin, vmax, _g=g, _key=key: _g._scalar_single_color(_key, val, vmin, vmax)
                         )
                 elif mode == "type" and "p_mask" in g.data and t < len(g.data["p_mask"]):
                     p_mask = g.data["p_mask"][t]
@@ -1260,6 +1285,40 @@ class DataVizGUI(QMainWindow):
         self.voronoi_transparency = 0.5
         self.voronoi_force_recalc = False
         self.selected_cell_idx = None
+        self._scalar_log_eps = 1e-12
+        self.show_scalar_histogram = False
+
+    def _is_logspace_scalar(self, key: str) -> bool:
+        """Keys containing 'gamma' are interpreted as log-space variables."""
+        return isinstance(key, str) and ("gamma" in key.lower())
+
+    def _transform_scalar_values(self, key: str, values: np.ndarray) -> np.ndarray:
+        """Transform scalar values for color mapping."""
+        arr = np.asarray(values, dtype=np.float32)
+        if self._is_logspace_scalar(key):
+            arr = np.log(np.clip(arr, self._scalar_log_eps, None))
+        return arr
+
+    def _scalar_vcenter(self, key: str) -> float | None:
+        """Return color midpoint in transformed space."""
+        if self._is_logspace_scalar(key):
+            return 0.0  # log(1.0)
+        return None
+
+    def _scalar_colors(self, key: str, values: np.ndarray) -> np.ndarray:
+        """Map scalar values to RGBA with key-specific transforms."""
+        vals_t = self._transform_scalar_values(key, values)
+        if key in self.scalar_ranges:
+            vmin, vmax = self.scalar_ranges[key]
+        else:
+            vmin, vmax = float(np.min(vals_t)), float(np.max(vals_t))
+        return scalar_to_rgba(vals_t, vmin, vmax, self._scalar_vcenter(key))
+
+    def _scalar_single_color(self, key: str, value: float,
+                             vmin: float, vmax: float) -> np.ndarray:
+        """Single-value color mapping wrapper (used by Voronoi animator)."""
+        val_t = self._transform_scalar_values(key, np.array([value], dtype=np.float32))
+        return scalar_to_rgba(val_t, vmin, vmax, self._scalar_vcenter(key))[0]
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1422,6 +1481,26 @@ class DataVizGUI(QMainWindow):
         self.colorbar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.colorbar_label.setMinimumHeight(120)
         cb_vlay.addWidget(self.colorbar_label)
+
+        hist_ctrl_row = QHBoxLayout()
+        hist_ctrl_row.addWidget(QLabel("Histogram bins:"))
+        self.hist_bins_spin = QSpinBox()
+        self.hist_bins_spin.setRange(5, 300)
+        self.hist_bins_spin.setValue(30)
+        self.hist_bins_spin.valueChanged.connect(self._on_hist_bins_changed)
+        hist_ctrl_row.addWidget(self.hist_bins_spin)
+        self.hist_btn = QPushButton("Show Histogram")
+        self.hist_btn.clicked.connect(self._on_show_histogram_clicked)
+        hist_ctrl_row.addWidget(self.hist_btn)
+        hist_ctrl_row.addStretch()
+        cb_vlay.addLayout(hist_ctrl_row)
+
+        self.histogram_label = QLabel()
+        self.histogram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.histogram_label.setMinimumHeight(240)
+        self.histogram_label.setVisible(False)
+        cb_vlay.addWidget(self.histogram_label)
+
         self.colorbar_group.setVisible(False)
         layout.addWidget(self.colorbar_group)
 
@@ -1747,8 +1826,21 @@ class DataVizGUI(QMainWindow):
         for key in self.scalar_keys:
             if key in raw and raw[key]:
                 try:
-                    all_vals = np.concatenate([v for v in raw[key] if v is not None])
-                    self.scalar_ranges[key] = (float(np.min(all_vals)), float(np.max(all_vals)))
+                    all_vals = np.concatenate([v for v in raw[key] if v is not None]).astype(np.float32)
+                    if self._is_logspace_scalar(key):
+                        pos = all_vals[all_vals > 0]
+                        if len(pos) == 0:
+                            print(f"[scalar range] Skipping {key}: no positive values for log scale")
+                            continue
+                        log_vals = np.log(np.clip(pos, self._scalar_log_eps, None))
+                        lo = float(np.min(log_vals))
+                        hi = float(np.max(log_vals))
+                        # Keep gamma=1 (log=0) at the midpoint by ensuring center is in range.
+                        lo = min(lo, 0.0)
+                        hi = max(hi, 0.0)
+                        self.scalar_ranges[key] = (lo, hi)
+                    else:
+                        self.scalar_ranges[key] = (float(np.min(all_vals)), float(np.max(all_vals)))
                 except Exception as e:
                     print(f"Could not compute range for {key}: {e}")
 
@@ -1896,7 +1988,10 @@ class DataVizGUI(QMainWindow):
                 for k in self.scalar_keys:
                     if k in self.scalar_ranges:
                         lo, hi = self.scalar_ranges[k]
-                        lines.append(f"  {k}: [{lo:.3f}, {hi:.3f}]")
+                        if self._is_logspace_scalar(k):
+                            lines.append(f"  {k} (log): [{lo:.3f}, {hi:.3f}] (center at gamma=1)")
+                        else:
+                            lines.append(f"  {k}: [{lo:.3f}, {hi:.3f}]")
         if self.sim_dict:
             lines.append("---")
             for k, v in list(self.sim_dict.items())[:15]:
@@ -1925,6 +2020,9 @@ class DataVizGUI(QMainWindow):
 
         # Clear neighbour selection on timestep change
         self.selected_cell_idx = None
+
+        if self.color_mode == "scalar":
+            self._update_colorbar_widget()
 
         self._refresh()
 
@@ -2003,7 +2101,13 @@ class DataVizGUI(QMainWindow):
         t_hi = (t[hi] - 0.5) * 2.0
         rgb[hi] = np.outer(1 - t_hi, _COLOR_MID) + np.outer(t_hi, _COLOR_END)
         cmap = mcolors.ListedColormap(rgb)
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        use_center = self._is_logspace_scalar(key)
+        vcenter = self._scalar_vcenter(key)
+
+        if use_center and vcenter is not None:
+            norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+        else:
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
         # Render with matplotlib
         dpi = 100
@@ -2012,7 +2116,17 @@ class DataVizGUI(QMainWindow):
         cb = matplotlib.colorbar.ColorbarBase(
             ax, cmap=cmap, norm=norm, orientation="horizontal"
         )
-        cb.set_label(key, color="#e0e0f0", fontsize=10)
+        if use_center:
+            cb.set_label(f"{key} (log scale)", color="#e0e0f0", fontsize=10)
+            lo_tick = vmin
+            hi_tick = vmax
+            mid_tick = vcenter
+            ticks = [lo_tick, mid_tick, hi_tick]
+            labels = [f"{np.exp(lo_tick):.3g}", "1.0", f"{np.exp(hi_tick):.3g}"]
+            cb.set_ticks(ticks)
+            cb.set_ticklabels(labels)
+        else:
+            cb.set_label(key, color="#e0e0f0", fontsize=10)
         cb.ax.tick_params(colors="#e0e0f0", labelsize=9)
         ax.set_facecolor("#1e1e3a")
         for spine in ax.spines.values():
@@ -2027,10 +2141,127 @@ class DataVizGUI(QMainWindow):
         plt.close(fig)
         return pixmap
 
+    def _render_histogram_pixmap(self, key: str, values: np.ndarray, bins: int):
+        """Render scalar histogram for current timestep as a QPixmap."""
+        from PyQt6.QtGui import QPixmap, QImage
+
+        arr = np.asarray(values, dtype=np.float32)
+        arr = arr[np.isfinite(arr)]
+
+        dpi = 100
+        fig, ax = plt.subplots(figsize=(4.8, 2.25), dpi=dpi)
+        fig.patch.set_facecolor("#1e1e3a")
+        ax.set_facecolor("#1e1e3a")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a2a4a")
+
+        if len(arr) == 0:
+            ax.text(0.5, 0.5, "No finite values", color="#e0e0f0",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            if self._is_logspace_scalar(key):
+                pos = arr[arr > 0]
+                dropped = len(arr) - len(pos)
+                if len(pos) == 0:
+                    ax.text(0.5, 0.5, "No positive values for log histogram", color="#e0e0f0",
+                            ha="center", va="center", transform=ax.transAxes)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                else:
+                    base_edges = np.histogram_bin_edges(pos, bins=bins)
+                    lo, hi = float(base_edges[0]), float(base_edges[-1])
+
+                    if hi > lo and lo > 0:
+                        logbins = np.logspace(np.log10(lo), np.log10(hi), len(base_edges))
+                        ax.hist(pos, bins=logbins, color="#e94560", edgecolor="#e0e0f0", alpha=0.85)
+                        ax.set_xscale("log")
+                    else:
+                        ax.hist(pos, bins=bins, color="#e94560", edgecolor="#e0e0f0", alpha=0.85)
+                    if dropped > 0:
+                        ax.set_title(f"{key} histogram (dropped <=0: {dropped})", color="#e0e0f0", fontsize=9)
+                    else:
+                        ax.set_title(f"{key} histogram", color="#e0e0f0", fontsize=9)
+            else:
+                ax.hist(arr, bins=bins, color="#e94560", edgecolor="#e0e0f0", alpha=0.85)
+                ax.set_title(f"{key} histogram", color="#e0e0f0", fontsize=9)
+
+            ax.set_ylabel("Count", color="#e0e0f0", fontsize=18, fontweight="bold")
+
+            # Ensure both major and minor tick labels are consistently styled
+            ax.tick_params(axis="both", which="both", colors="#e0e0f0", labelcolor="#e0e0f0", labelsize=16)
+            for lbl in ax.get_xticklabels(minor=False) + ax.get_xticklabels(minor=True):
+                lbl.set_color("#e0e0f0")
+                lbl.set_fontsize(16)
+                lbl.set_fontweight("bold")
+            for lbl in ax.get_yticklabels(minor=False) + ax.get_yticklabels(minor=True):
+                lbl.set_color("#e0e0f0")
+                lbl.set_fontsize(16)
+                lbl.set_fontweight("bold")
+
+            # Style offset/scientific notation text as well
+            ax.xaxis.get_offset_text().set_color("#e0e0f0")
+            ax.xaxis.get_offset_text().set_fontsize(16)
+            ax.xaxis.get_offset_text().set_fontweight("bold")
+            ax.yaxis.get_offset_text().set_color("#e0e0f0")
+            ax.yaxis.get_offset_text().set_fontsize(16)
+            ax.yaxis.get_offset_text().set_fontweight("bold")
+
+        fig.tight_layout(pad=0.4)
+        fig.canvas.draw()
+        buf = fig.canvas.buffer_rgba()
+        w, h = fig.canvas.get_width_height()
+        img = QImage(buf, w, h, QImage.Format.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(img)
+        plt.close(fig)
+        return pixmap
+
+    def _update_histogram_widget(self):
+        """Refresh histogram for current scalar/timestep if enabled."""
+        if (not self.show_scalar_histogram or self.data is None or
+            self.color_mode != "scalar" or not self.scalar_key):
+            self.histogram_label.setVisible(False)
+            return
+
+        key = self.scalar_key
+        if key not in self.data:
+            self.histogram_label.setVisible(False)
+            return
+        if self.current_timestep >= len(self.data[key]):
+            self.histogram_label.setVisible(False)
+            return
+
+        vals = self.data[key][self.current_timestep]
+        if vals is None:
+            self.histogram_label.setVisible(False)
+            return
+
+        bins = int(self.hist_bins_spin.value())
+        pixmap = self._render_histogram_pixmap(key, vals, bins)
+        self.histogram_label.setPixmap(
+            pixmap.scaled(
+                self.histogram_label.width() or pixmap.width(),
+                pixmap.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.histogram_label.setVisible(True)
+
+    def _on_show_histogram_clicked(self):
+        self.show_scalar_histogram = True
+        self._update_histogram_widget()
+
+    def _on_hist_bins_changed(self, _val: int):
+        if self.show_scalar_histogram and self.color_mode == "scalar":
+            self._update_histogram_widget()
+
     def _update_colorbar_widget(self):
         """Show/hide and refresh the colorbar based on current color mode."""
         if self.color_mode != "scalar" or self.data is None:
             self.colorbar_group.setVisible(False)
+            self.histogram_label.setVisible(False)
             return
         key = self.scalar_key
         vmin, vmax = self.scalar_ranges.get(key, (-1.0, 1.0))
@@ -2043,6 +2274,7 @@ class DataVizGUI(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+        self._update_histogram_widget()
         self.colorbar_group.setVisible(True)
 
     def _on_polarity_changed(self, state: int):

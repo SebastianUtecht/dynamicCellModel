@@ -34,10 +34,10 @@ class Simulation:
         self.dtype          = sim_dict['dtype']             # Data type for tensors. float32 or float64
         self.random_seed    = sim_dict['random_seed']       # Random seed for reproducibility
         self.yield_every    = sim_dict['yield_every']       # How many timesteps between data yields
-        self.min_batch_size = 512
+        self.min_batch_size = 1024
 
         # Model parameters
-        self.k              = 12                            # Number of nearest neighbors to consider
+        self.k              = 16                            # Number of nearest neighbors to consider
         self.true_neighbour_max     = 50                    # Maximum number of true neighbors in former timestep
         self.dt             = sim_dict['dt']                # Size of timestep for simulation
         self.sqrt_dt        = np.sqrt(self.dt)              # Square root of time step. We calculate it here instead of in the update loop
@@ -82,6 +82,17 @@ class Simulation:
         self.interaction_dist = sim_dict['interaction_dist']      # Maximum distance for interactions. Should be larger than r0, but not too large to avoid memory issues
         self.seethru        = 0
         self.cell_wall_interaction = sim_dict['cell_wall_interaction']  # 0 if only repulsion, otherwise up to 1 for attraction
+
+        #Neighbors debugging
+        self.neighbour_type = sim_dict['neighbour_type']
+        if self.neighbour_type == 'voronoi':
+            self.get_neighbors = self.get_neighbors_vor
+        elif self.neighbour_type == 'knear':
+            self.get_neighbors = self.get_neighbors_knear
+        else:
+            raise ValueError("neighbour_type should be either 'voronoi' or 'knear'")
+        
+        self.use_q_mean = sim_dict['use_q_mean']
 
         # stuff we need to initialize
         self.idx    = None                                      # Indices of nearest neighbors
@@ -131,21 +142,12 @@ class Simulation:
         torch.manual_seed(self.random_seed)                 # For reproducibility
         self.tstep = 0
     
-    def elong_func_linear(self, q_mean, dx):
-        dot = (q_mean * dx).sum(dim=2)
-        dot = torch.abs(dot)
-        elong =  1 - 4/np.pi * torch.arccos(dot)
-        return elong
-    
-    def elong_func_cos(self, q_mean, dx):
-        return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
-    
-    def calculate_area(self, d, dx, q, p, z_mask, gamma_par, gamma_perp):
+    def calculate_area(self, ri_tilde, q, p, z_mask):
         # Using the formula A = 0.5 * sum(|r_{ij} x r_{ij+1}|) where r_{ij} is the vector from cell i to its j-th neighbor.
         # We apply gamma-based elongation to dx before calculating the area, which couples the area penalty to gamma
         # and ensures gamma equilibrates rather than oscillates.
-        N, m, _ = dx.shape
-        device = dx.device
+        N = ri_tilde.shape[0]
+        device = ri_tilde.device
         eps = 1e-8
 
         # # Calculate basis vectors
@@ -153,32 +155,9 @@ class Simulation:
         t2 = torch.cross(p, q, dim=1)                         # (N, 3)
         t2 = t2 / (torch.norm(t2, dim=1, keepdim=True) + eps)
         
-        # # Calculate perpendicular direction
-        # perp_dir = torch.cross(q, p, dim=1)
-        # perp_dir = perp_dir / (torch.norm(perp_dir, dim=1, keepdim=True) + eps)
-        
-        # # Apply gamma-based elongation to displacement vectors
-        # # Decompose dx into parallel and perpendicular components
-        # gamma_par_exp = torch.exp(gamma_par[:, None])  # (N, 1)
-        # gamma_perp_exp = torch.exp(gamma_perp[:, None])  # (N, 1)
-        
-        # # Project dx onto q and perp_dir to get parallel and perpendicular components
-        # dx_par_proj = (q[:, None, :] * dx).sum(dim=2, keepdim=True)  # (N, m, 1)
-        # dx_perp_proj = (perp_dir[:, None, :] * dx).sum(dim=2, keepdim=True)  # (N, m, 1)
-        
-        # # Reconstruct parallel and perpendicular components
-        # dx_par = dx_par_proj * q[:, None, :]  # (N, m, 3)
-        # dx_perp = dx_perp_proj * perp_dir[:, None, :]  # (N, m, 3)
-        
-        # # Get the component orthogonal to both q and perp_dir
-        # dx_other = dx - dx_par - dx_perp  # (N, m, 3)
-        
-        # # Apply elongation factors and reconstruct elongated displacement
-        # dx_elongated = gamma_par_exp[:, :, None] * dx_par + gamma_perp_exp[:, :, None] * dx_perp + dx_other  # (N, m, 3)
-        # dx_elongated = dx
-        
         # Calculate position vectors using elongated displacements
-        r = d[:, :, None] * dx #* dx_elongated                      # (N, m, 3)
+        # r = d[:, :, None] * dx #* dx_elongated                      # (N, m, 3)
+        r = ri_tilde # (N, m, 3)
 
         # Project onto tangent basis
         x = torch.einsum("nmk,nk->nm", r, t1)                  # (N, m)
@@ -229,29 +208,6 @@ class Simulation:
     def find_potential_neighbours(x, k):
 
         with torch.no_grad():
-            # qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)
-            # qj = torch.transpose_copy(qi, 0, 1)
-            # q_mean = (qi + qj)/2
-
-            # pi = p[:, None, :].expand(p.shape[0], p.shape[0], 3)
-            # pj = torch.transpose_copy(pi, 0, 1)
-            # wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)
-
-            # gamma_i = gamma[:, None].expand(gamma.shape[0], q.shape[0])
-            # gamma_j = torch.transpose_copy(gamma_i, 0, 1)
-            # gamma_mean = (gamma_i + gamma_j)/2
-            
-            # val = 2 * ((q_mean * dx).sum(dim=2))**2 - 1
-
-            # exponent = gamma_mean * 1/val
-            # exponent[wall_mask] = 0.0
-
-            # Brute force method
-            # dx = x[:, None] - x[None, :]                            # Pairwise differences
-            # d = torch.linalg.norm(dx, dim=2)                        # Pairwise distances
-            # d_tilde = d * torch.exp(exponent)        
-            # d, idx = d.topk(k+1, dim=1, largest=False, sorted=True)   # Get the k+1 smallest distances (including self-distance)
-
             # cKD-tree method
             x_cpu = x.cpu().numpy()
             tree = cKDTree(x_cpu)
@@ -306,45 +262,45 @@ class Simulation:
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
-            # qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)
-            # qj = torch.transpose_copy(qi, 0, 1)
-            # q_mean = (qi + qj)/2
-
-            # pi = p[:, None, :].expand(p.shape[0], p.shape[0], 3)
-            # pj = torch.transpose_copy(pi, 0, 1)
-            # wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)
-
-            # gamma_i = gamma[:, None].expand(gamma.shape[0], q.shape[0])
-            # gamma_j = torch.transpose_copy(gamma_i, 0, 1)
-            # gamma_mean = (gamma_i + gamma_j)/2
-            
-            # val = 2 * ((q_mean * dx).sum(dim=2))**2 - 1
-
-            # exponent = gamma_mean * 1/val
-            # exponent[wall_mask] = 0.0
-
     def find_true_neighbours(self, d, dx, idx, p, q, gamma_par, gamma_perp, test_batches=True):
         with torch.no_grad():
 
-            # qi = q[:, None, :].expand(q.shape[0], d.shape[1], 3)
-            # qj = q[idx]
-            # q_mean = (qi + qj)/2
+            pi = p[:, None, :].expand(p.shape[0], idx.shape[1], 3)
+            pj = p[idx]
+            qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
+            qj = q[idx]
 
-            # pi = p[:, None, :].expand(p.shape[0], d.shape[1], 3)
-            # pj = p[idx]
-            # wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)
+            if self.use_q_mean:
+                q_mean = (qi + qj)
+                q_mean = q_mean / torch.linalg.norm(q_mean, dim=2, keepdim=True)
+                p_mean = (pi + pj)
+                p_mean = p_mean / torch.linalg.norm(p_mean, dim=2, keepdim=True)
+            else:
+                q_mean = qi
+                p_mean = pi
 
-            # gamma_i = gamma_par[:, None].expand(gamma_par.shape[0], d.shape[1])
-            # gamma_j = gamma_perp[idx]
-            # gamma_mean = (gamma_i + gamma_j )/2
 
-            # elong = self.elong_func_cos(q_mean, dx)
+            gamma_par_i = gamma_par[:, None].expand(gamma_par.shape[0], idx.shape[1])
+            gamma_par_j = gamma_par[idx]
+            gamma_par_i_exp = torch.exp(gamma_par_i)
+            gamma_par_j_exp = torch.exp(gamma_par_j)
+            gamma_par_mean = (gamma_par_i_exp + gamma_par_j_exp)/2 
+            gamma_par_mean = torch.log(gamma_par_mean)
 
-            # exponent = gamma_mean * (-elong)
-            # exponent[wall_mask] = 0.0
+            gamma_perp_i = gamma_perp[:, None].expand(gamma_perp.shape[0], idx.shape[1])
+            gamma_perp_j = gamma_perp[idx]
+            gamma_perp_i_exp = torch.exp(gamma_perp_i)
+            gamma_perp_j_exp = torch.exp(gamma_perp_j)
+            gamma_perp_mean = (gamma_perp_i_exp + gamma_perp_j_exp)/2 
+            gamma_perp_mean = torch.log(gamma_perp_mean)
 
-            dx_tilde = dx #* torch.exp(exponent)[:,:,None]
-            d_tilde  = d #* torch.exp(exponent)
+            dx_normed = dx / (d[:, :, None] + 1e-8)
+            perp_dir = torch.cross(q_mean, p_mean, dim=2)
+
+            Z_gamma_par = torch.exp(gamma_par_mean[:,:,None]) * (q_mean * dx_normed).sum(dim=2)[:,:,None] * q_mean
+            Z_gamma_perp = torch.exp(gamma_perp_mean[:,:,None]) * (perp_dir * dx_normed).sum(dim=2)[:,:,None] * perp_dir
+            dx_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (p_mean * dx_normed).sum(dim=2)[:,:,None] * p_mean)
+            d_tilde = torch.linalg.norm(dx_tilde, dim=2)
 
             total_cells = dx.shape[0]
             neighbor_count = dx.shape[1]
@@ -414,61 +370,47 @@ class Simulation:
 
         return d, dx, idx, z_mask
 
-    # def get_neighbors(self, x, q, gamma, k):
-    #     """
-    #     Finds the k nearest neighbors for each cell and applies a voronoi mask to exclude false neighbors.
-    #     Parameters:
-    #         x (torch.Tensor): The positions of the cells.
-    #         k (int): The number of nearest neighbors to consider.
-    #     Returns:
-    #         d (torch.Tensor): The distances to the neighbors.
-    #         dx (torch.Tensor): The normalized displacement vectors to the neighbors.
-    #         idx (torch.Tensor): The indices of the neighbors.
-    #         z_mask (torch.Tensor): A boolean mask indicating which neighbors are true neighbors based on a distance cutoff
-    #     """
+    def get_neighbors_knear(self, x, p, q, gamma_par, gamma_perp, k):
+        """
+        Finds the k nearest neighbors for each cell and applies a voronoi mask to exclude false neighbors.
+        Parameters:
+            x (torch.Tensor): The positions of the cells.
+            k (int): The number of nearest neighbors to consider.
+        Returns:
+            d (torch.Tensor): The distances to the neighbors.
+            dx (torch.Tensor): The normalized displacement vectors to the neighbors.
+            idx (torch.Tensor): The indices of the neighbors.
+            z_mask (torch.Tensor): A boolean mask indicating which neighbors are true neighbors based on a distance cutoff
+        """
 
-    #     # gamma_j = gamma[idx]
-    #     # log_gamma_mean = (gamma_i + gamma_j)/2
-    #     # d_tilde = d * torch.exp(log_gamma_mean * cos2theta)
-
-    #     with torch.no_grad():
-    #         all_dists = x[:, None] - x[None, :]
-    #         qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)                    #TODO: Change this to be symmetric. I.e. q_mean = q_i + q_j / 2
-    #         # gamma_i = gamma[:, None].expand(gamma.shape[0], q.shape[0])
-    #         # val = 2 * ((qi * all_dists).sum(dim=2))**2 - 1
-    #         # val = self.gamma_func(qi, all_dists)
-    #         # finding all potential neighbors via knn 
-    #         d = torch.linalg.norm(all_dists, dim=2)
-    #         # d = d * torch.exp(gamma_i * 1/val)
-    #         d, idx = d.topk(k+1, dim=1, largest=False, sorted=True)
-    #         d, idx = d[:, 1:], idx[:, 1:]
+        with torch.no_grad():
+            all_dists = x[:, None] - x[None, :]
+            d = torch.linalg.norm(all_dists, dim=2)
+            d, idx = d.topk(k+1, dim=1, largest=False, sorted=True)
+            d, idx = d[:, 1:], idx[:, 1:]
             
-    #         # exclude cells too far away
-    #         z_mask = d < self.interaction_dist
+            # exclude cells too far away
+            qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)
+            z_mask = d < self.interaction_dist
 
-    #     full_neighbor_list = x[idx]                                                 # Get the full neighbor list
-    #     dx = x[:, None, :] - full_neighbor_list                                     # Calculate pairwise distances
+        full_neighbor_list = x[idx]                                                 # Get the full neighbor list
+        dx = x[:, None, :] - full_neighbor_list                                     # Calculate pairwise distances
 
-    #     # Shorten tensors to avoid unnecessary computations and memory issues
-    #     sort_idx = torch.argsort(z_mask.int(), dim=1, descending=True)              # We sort the boolean voronoi mask in descending order, i.e 1,1,1,...,0,0
-    #     z_mask = torch.gather(z_mask, 1, sort_idx)                                  # Reorder z_mask
-    #     dx = torch.gather(dx, 1, sort_idx[:, :, None].expand(-1, -1, 3))            # Reorder dx
-    #     idx = torch.gather(idx, 1, sort_idx)                                        # Reorder idx
-    #     m = torch.max(torch.sum(z_mask, dim=1)) + 1                                 # Finding new maximum number of true neighbors
-    #     self.true_neighbour_max = m                                                 # Saving it so we can use it again later
-    #     z_mask = z_mask[:, :m]                                                      # Shorten z_mask
-    #     dx = dx[:, :m]                                                              # Shorten dx
-    #     idx = idx[:, :m]                                                            # Shorten idx
+        # Shorten tensors to avoid unnecessary computations and memory issues
+        sort_idx = torch.argsort(z_mask.int(), dim=1, descending=True)              # We sort the boolean voronoi mask in descending order, i.e 1,1,1,...,0,0
+        z_mask = torch.gather(z_mask, 1, sort_idx)                                  # Reorder z_mask
+        dx = torch.gather(dx, 1, sort_idx[:, :, None].expand(-1, -1, 3))            # Reorder dx
+        idx = torch.gather(idx, 1, sort_idx)                                        # Reorder idx
+        m = torch.max(torch.sum(z_mask, dim=1)) + 1                                 # Finding new maximum number of true neighbors
+        self.true_neighbour_max = m                                                 # Saving it so we can use it again later
+        z_mask = z_mask[:, :m]                                                      # Shorten z_mask
+        dx = dx[:, :m]                                                              # Shorten dx
+        idx = idx[:, :m]                                                            # Shorten idx
 
-    #     d = torch.sqrt(torch.sum(dx**2, dim=2))                                     # Calculate w. new ordering
-    #     dx = dx / d[:, :, None]                                                     # Normalize dx (also new ordering)
+        d = torch.sqrt(torch.sum(dx**2, dim=2))                                     # Calculate w. new ordering
+        dx = dx / d[:, :, None]                                                     # Normalize dx (also new ordering)
 
-    #     return d, dx, idx, z_mask
-
-    # def gravity(self, pos):
-    # z = pos[:,2]
-    # v_add = self.grav_str * z
-    # return v_add.sum()
+        return d, dx, idx, z_mask
 
     def radial_stretch(self, pos, p_mask):
         if self.stretch_factor == 0.0:  
@@ -587,16 +529,16 @@ class Simulation:
         pj = p[idx]
         qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
         qj = q[idx]
+        
+        if self.use_q_mean:
+            q_mean = (qi + qj)
+            q_mean = q_mean / torch.linalg.norm(q_mean, dim=2, keepdim=True)
+            p_mean = (pi + pj)
+            p_mean = p_mean / torch.linalg.norm(p_mean, dim=2, keepdim=True)
+        else:
+            q_mean = qi
+            p_mean = pi
 
-        # q_mean = (qi + qj)
-        # q_mean = q_mean / torch.linalg.norm(q_mean, dim=2, keepdim=True)
-        # p_mean = (pi + pj)
-        # p_mean = p_mean / torch.linalg.norm(p_mean, dim=2, keepdim=True)
-        q_mean = qi
-        p_mean = pi
-        
-        # if torch.sum(torch.abs(alpha_par)) > 0.0001 or torch.sum(torch.abs(alpha_perp)) > 0.0001:  
-        
         # Expanding alpha_par, alpha_perp
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
         alpha_par_j = alpha_par[idx]
@@ -612,8 +554,8 @@ class Simulation:
         # with torch.no_grad():
         perp_dir = torch.cross(q_mean, p_mean, dim=2)
 
-        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                          #* dx
-        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                #* dx
+        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                          
+        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                               
         Z = Z_par + Z_perp
 
         pi_tilde = pi - Z
@@ -647,16 +589,6 @@ class Simulation:
         Z_gamma_perp = torch.exp(gamma_perp_mean[:,:,None]) * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir
         ri_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (p_mean * dx).sum(dim=2)[:,:,None] * p_mean)
         d_tilde = torch.linalg.norm(ri_tilde, dim=2)
-
-        # if self.tstep % 1000 == 0:
-        #     # Check orthonormality
-        #     dot_qp = torch.sum(q_mean * p_mean, dim=2)
-        #     dot_qperp = torch.sum(q_mean * perp_dir, dim=2)
-        #     dot_pperp = torch.sum(p_mean * perp_dir, dim=2)
-        #     print(f"q·p = {dot_qp[0,:5]}")  # Should be ~0
-        #     print(f"q·perp = {dot_qperp[0,:5]}")  # Should be ~0
-        #     print(f"p·perp = {dot_pperp[0,:5]}")  # Should be ~0
-        #     print('mean difference in d_tilde vs d:', torch.mean(torch.abs(d_tilde - d)))
     
 
         # All the S-terms are calculated
@@ -692,11 +624,11 @@ class Simulation:
         Vij_sum = torch.sum(Vij)
 
         # with torch.no_grad():
-        Ai = self.calculate_area(d, dx, q, p, z_mask, gamma_par, gamma_perp)
+        Ai = self.calculate_area(ri_tilde, q, p, z_mask)
         
         if self.penalize_A:
-            # A_penalty = self.penalize_A * (Ai - self.target_A)**2
-            A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
+            A_penalty = self.penalize_A * (Ai - self.target_A)**2
+            # A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
             Vij_sum += A_penalty.sum()
 
 
@@ -802,7 +734,7 @@ class Simulation:
 
         # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
         # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
-        d, dx, idx, z_mask = self.get_neighbors_vor(x, p, q, gamma_par, gamma_perp, k=self.k)
+        d, dx, idx, z_mask = self.get_neighbors(x, p, q, gamma_par, gamma_perp, k=self.k)
   
         # Calculate potential
         V, Vi, Ai = self.potential(x, p, q, p_mask,
@@ -1437,7 +1369,9 @@ def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
     # All cells in the stretch_frace fraction of the radius from the center are type 1
     # Sorting cells by their distance from the center
     sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-    mask[sorted_indices[:int(N**2*stretch_frac)]] = 1
+
+    mask[sorted_indices[:int(N**2 * stretch_frac/2)]] = 1
+    mask[sorted_indices[int(N**2 * (1-stretch_frac/2)):]] = 1
 
     alpha_par = np.zeros(N**2)
     alpha_perp = np.zeros(N**2)
