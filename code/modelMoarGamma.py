@@ -34,7 +34,7 @@ class Simulation:
         self.dtype          = sim_dict['dtype']             # Data type for tensors. float32 or float64
         self.random_seed    = sim_dict['random_seed']       # Random seed for reproducibility
         self.yield_every    = sim_dict['yield_every']       # How many timesteps between data yields
-        self.min_batch_size = 512
+        self.min_batch_size = 1024                          # Minimum batch size for true neighbor search. The simulation will automatically find the optimal batch size based on available memory, but this is the lower limit for that process. Setting it higher can speed up the simulation, but also risks out of memory errors if set too high.
 
         # Model parameters
         self.k              = 18                            # Number of nearest neighbors to consider
@@ -75,8 +75,7 @@ class Simulation:
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
-        # self.offsets        = torch.tensor(sim_dict['offsets'], device=self.device, dtype=self.dtype)
-        self.interaction_dist = sim_dict['interaction_dist']      # Maximum distance for interactions. Should be larger than r0, but not too large to avoid memory issues
+        self.interaction_dist = sim_dict['interaction_dist']            # Maximum distance for interactions. Should be larger than r0, but not too large to avoid memory issues
         self.seethru        = 0
         self.cell_wall_interaction = sim_dict['cell_wall_interaction']  # 0 if only repulsion, otherwise up to 1 for attraction
 
@@ -138,6 +137,9 @@ class Simulation:
             raise ValueError("elong_func_type should be either 'linear' or 'cos'")
         
         self.use_trans_neighbors = sim_dict['use_trans_neighbors']
+        self.use_gamma_mean = sim_dict['use_gamma_mean']
+        self.gamma_diff_penalty = sim_dict['gamma_diff_penalty']
+        self.penalize_A = sim_dict['penalize_A']
 
         # Set random seed
         torch.manual_seed(self.random_seed)                 # For reproducibility
@@ -152,17 +154,6 @@ class Simulation:
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
 
-    
-    #         all_dists = x[:, None] - x[None, :]
-    #         qi = q[:, None, :].expand(q.shape[0], q.shape[0], 3)                    #TODO: Change this to be symmetric. I.e. q_mean = q_i + q_j / 2
-    #         # gamma_i = gamma[:, None].expand(gamma.shape[0], q.shape[0])
-    #         # val = 2 * ((qi * all_dists).sum(dim=2))**2 - 1
-    #         # val = self.gamma_func(qi, all_dists)
-    #         # finding all potential neighbors via knn 
-    #         d = torch.linalg.norm(all_dists, dim=2)
-    #         # d = d * torch.exp(gamma_i * 1/val)
-    #         d, idx = d.topk(k+1, dim=1, largest=False, sorted=True)
-    #         d, idx = d[:, 1:], idx[:, 1:]
 
     @staticmethod
     def find_potential_neighbours(x, k):
@@ -240,7 +231,10 @@ class Simulation:
 
                 gamma_i = gamma[:, None].expand(gamma.shape[0], d.shape[1])
                 gamma_j = gamma[idx]
-                gamma_mean = torch.log((torch.exp(gamma_i) + torch.exp(gamma_j))/2)
+                if self.use_gamma_mean:
+                    gamma_mean = torch.log((torch.exp(gamma_i) + torch.exp(gamma_j))/2)
+                else:
+                    gamma_mean = gamma_i
 
                 elong = self.elong_func(q_mean, (dx / d[:,:,None]) )                      # cos(2theta) or linear from theta?
 
@@ -612,7 +606,10 @@ class Simulation:
         # My way of gamma
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
-        gamma_mean = torch.log((torch.exp(gamma_i) + torch.exp(gamma_j))/2)
+        if self.use_gamma_mean:
+            gamma_mean = torch.log((torch.exp(gamma_i) + torch.exp(gamma_j))/2)
+        else:
+            gamma_mean = gamma_i
         
         elong = self.elong_func(q_mean, dx)                      # cos(2theta) or linear from theta?            
 
@@ -641,9 +638,6 @@ class Simulation:
 
         Vij = z_mask.float() * S * (torch.exp(-d_tilde) - torch.exp(-d_tilde/5))        # Calculating the potential energy between particles masking out false interactions via voronoi_mask
         
-        # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
-        # Vij += z_mask.float() * 1/100 * (gamma_i - gamma_j)**2  
-
         if torch.unique(p_mask).shape[0] > 1:        # If we have multiple cell types we need to add the repulsion for the purely repulsive interactions
             for repulsion_mask in repulsion_mask_lst:
                 # find the masked interactions for which dists < eq_dist
@@ -657,7 +651,37 @@ class Simulation:
             Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val
         
         Vij_sum = torch.sum(Vij)
-        Vij_sum += torch.abs(gamma).sum() * 1/50
+
+        # z_mask_float = z_mask.to(d.dtype)
+        # valid_counts = torch.sum(z_mask_float, dim=1).clamp(min=1.0)
+        # log_d_tilde = torch.log(torch.clamp(d, min=1e-8))
+        # mean_log_d_tilde = torch.sum(log_d_tilde * z_mask_float, dim=1) / valid_counts
+        # dists_geometric_mean = torch.exp(mean_log_d_tilde)
+
+
+
+        # Geometric mean of exponents with masking
+        if self.penalize_A:
+            assert self.use_gamma_mean, "Penalizing A only makes sense if we use the gamma mean for interactions"
+            assert self.gamma_diff_penalty == 0.0, "Penalizing A and gamma difference penalty at the same time does not make sense as they are both trying to achieve the same thing"
+
+            valid_counts = torch.sum(z_mask, dim=1).clamp(min=1.0)
+            log_exponent = torch.log(torch.clamp(exponent, min=1e-8))
+            mean_log_d_tilde = torch.sum(log_exponent * z_mask.float(), dim=1) / valid_counts
+            exponent_geometric_mean = torch.exp(mean_log_d_tilde)
+            A_penalty = self.penalize_A * (1 - exponent_geometric_mean)**2
+            # A_penalty = self.penalize_A * (Ai - self.target_A)**2
+            # A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
+            Vij_sum += A_penalty.sum()
+
+
+
+        if self.gamma_diff_penalty:
+            assert self.use_gamma_mean, "Gamma difference penalty only makes sense if we use the gamma mean for interactions"
+            gamma_diff = (gamma_i - gamma_j)**2
+            gamma_diff[~z_mask] = 0.0
+            gamma_diff_sum = torch.sum(gamma_diff)
+            Vij_sum += gamma_diff_sum * self.gamma_diff_penalty
 
         if self.tstep > 1_000:
             # Boundary conditions          
@@ -725,7 +749,7 @@ class Simulation:
             bool: Whether to update potential neighbors or not.
 
         """
-        if self.division == True or self.tstep < 5_000:        # If cell division has occurred or we are in the early stages
+        if self.division or self.tstep < 5_00:        # If cell division has occurred or we are in the early stages
             return True
         elif self.idx is None:                                  # If we have not found any neighbors yet
             return True
@@ -759,7 +783,7 @@ class Simulation:
 
         # Start with cell division
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
-        self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
+        # self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         # k = self.update_k(self.true_neighbour_max)      # Update k based on last iteration
         # k = min(k, len(x) - 1)                          # No reason letting k be larger than number of cells
@@ -909,7 +933,8 @@ class Simulation:
                 b0      = beta[idx]
                 alpha_par0 = alpha_par[idx]
                 alpha_perp0 = alpha_perp[idx]
-                gamma0 = gamma[idx]
+                # gamma0 = gamma[idx]
+                gamma0 = torch.ones_like(b0, device=self.device, dtype=self.dtype) #for now let's just do new cells have no elongation.
 
                 # make a random vector
                 move = torch.empty_like(x0).normal_()
@@ -936,84 +961,84 @@ class Simulation:
 
         return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
 
-    def cell_apoptosis(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
-        """
-        Handles cell apoptosis events.
+    # def cell_apoptosis(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
+    #     """
+    #     Handles cell apoptosis events.
 
-        Parameters:
-            x (torch.Tensor): The cell positions.
-            p (torch.Tensor): The apicobasal polarities.
-            q (torch.Tensor): The planar cell polarities.
-            p_mask (torch.Tensor or None): The particle mask.
-            alpha_par (torch.Tensor): The parallel alpha parameter.
-            alpha_perp (torch.Tensor): The perpendicular alpha parameter.
-            gamma (torch.Tensor): The gamma (elongation) parameter.
+    #     Parameters:
+    #         x (torch.Tensor): The cell positions.
+    #         p (torch.Tensor): The apicobasal polarities.
+    #         q (torch.Tensor): The planar cell polarities.
+    #         p_mask (torch.Tensor or None): The particle mask.
+    #         alpha_par (torch.Tensor): The parallel alpha parameter.
+    #         alpha_perp (torch.Tensor): The perpendicular alpha parameter.
+    #         gamma (torch.Tensor): The gamma (elongation) parameter.
 
-        Returns:
-            Tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor or None, torch.Tensor]: A tuple containing:
-                - apoptosis (bool): Whether apoptosis occurred.
-                - x (torch.Tensor): Cell positions with new cells
-                - p (torch.Tensor): Apicobasal polarities with new cells
-                - q (torch.Tensor): Planar cell polarities with new cells
-                - p_mask (torch.Tensor or None): The updated particle mask.
-                - beta (torch.Tensor): The apoptosis probabilities.
-                - alpha_par (torch.Tensor): The parallel alpha parameter with new cells.
-                - alpha_perp (torch.Tensor): The perpendicular alpha parameter with new cells.
-                - gamma (torch.Tensor): The gamma (elongation) parameter with new cells.
-        """
+    #     Returns:
+    #         Tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor or None, torch.Tensor]: A tuple containing:
+    #             - apoptosis (bool): Whether apoptosis occurred.
+    #             - x (torch.Tensor): Cell positions with new cells
+    #             - p (torch.Tensor): Apicobasal polarities with new cells
+    #             - q (torch.Tensor): Planar cell polarities with new cells
+    #             - p_mask (torch.Tensor or None): The updated particle mask.
+    #             - beta (torch.Tensor): The apoptosis probabilities.
+    #             - alpha_par (torch.Tensor): The parallel alpha parameter with new cells.
+    #             - alpha_perp (torch.Tensor): The perpendicular alpha parameter with new cells.
+    #             - gamma (torch.Tensor): The gamma (elongation) parameter with new cells.
+    #     """
 
-        beta = self.beta            
+    #     beta = self.beta            
 
-        if torch.sum(beta) < 1e-8:              # If division probabilities are negligible no division occurs
-            return False, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma
+    #     if torch.sum(beta) < 1e-8:              # If division probabilities are negligible no division occurs
+    #         return False, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma
 
-        # set probability according to beta and dt
-        d_prob = beta
-        # flip coins
-        draw = torch.empty_like(beta).uniform_()
-        # find successes
-        events = draw < d_prob
-        division = False
+    #     # set probability according to beta and dt
+    #     d_prob = beta
+    #     # flip coins
+    #     draw = torch.empty_like(beta).uniform_()
+    #     # find successes
+    #     events = draw < d_prob
+    #     division = False
 
-        if torch.sum(events) > 0:
-            with torch.no_grad():
-                division = True
-                # find cells that will divide
-                idx = torch.nonzero(events)[:, 0]
+    #     if torch.sum(events) > 0:
+    #         with torch.no_grad():
+    #             division = True
+    #             # find cells that will divide
+    #             idx = torch.nonzero(events)[:, 0]
 
-                x0      = x[idx, :]
-                p0      = p[idx, :]
-                q0      = q[idx, :]
-                p_mask0 = p_mask[idx]
-                b0      = beta[idx]
-                alpha_par0 = alpha_par[idx]
-                alpha_perp0 = alpha_perp[idx]
-                gamma0 = gamma[idx]
+    #             x0      = x[idx, :]
+    #             p0      = p[idx, :]
+    #             q0      = q[idx, :]
+    #             p_mask0 = p_mask[idx]
+    #             b0      = beta[idx]
+    #             alpha_par0 = alpha_par[idx]
+    #             alpha_perp0 = alpha_perp[idx]
+    #             gamma0 = gamma[idx]
 
-                # make a random vector
-                move = torch.empty_like(x0).normal_()
+    #             # make a random vector
+    #             move = torch.empty_like(x0).normal_()
 
-                # place new cells
-                x0 = x0 + move
+    #             # place new cells
+    #             x0 = x0 + move
 
-                # append new cell data to the system state
-                x = torch.cat((x, x0))
-                p = torch.cat((p, p0))
-                q = torch.cat((q, q0))
-                p_mask = torch.cat((p_mask, p_mask0))
-                beta = torch.cat((beta, b0))
-                alpha_par = torch.cat((alpha_par, alpha_par0))
-                alpha_perp = torch.cat((alpha_perp, alpha_perp0))
-                gamma = torch.cat((gamma, gamma0))
+    #             # append new cell data to the system state
+    #             x = torch.cat((x, x0))
+    #             p = torch.cat((p, p0))
+    #             q = torch.cat((q, q0))
+    #             p_mask = torch.cat((p_mask, p_mask0))
+    #             beta = torch.cat((beta, b0))
+    #             alpha_par = torch.cat((alpha_par, alpha_par0))
+    #             alpha_perp = torch.cat((alpha_perp, alpha_perp0))
+    #             gamma = torch.cat((gamma, gamma0))
 
-        x.requires_grad = True
-        p.requires_grad = True
-        q.requires_grad = True
-        alpha_par.requires_grad = True
-        alpha_perp.requires_grad = True
-        gamma.requires_grad = True
+    #     x.requires_grad = True
+    #     p.requires_grad = True
+    #     q.requires_grad = True
+    #     alpha_par.requires_grad = True
+    #     alpha_perp.requires_grad = True
+    #     gamma.requires_grad = True
 
-        return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
+    #     return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
     
 
 def save(data_tuple, name, output_folder):
@@ -1386,5 +1411,157 @@ def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
         gamma[:]        = np.log(gamma_params[0])
 
     plain_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    
+
     return plain_data
+
+def make_stretch_cylinder(N, stretch_frac, mirrored=True, radius=10, length=30, alpha_params=None, gamma_params=None):
+    """
+    Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
+
+    Parameters
+        N (int): The number of cells to generate.
+        stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
+        mirrored (bool): Whether to stretch to both sides or only 1.
+        radius (float): The radius of the cylinder.
+        length (float): The length of the cylinder.
+
+    Returns
+        tuple: A tuple containing the following elements:
+            - mask (np.ndarray): The mask indicating the type of each cell.
+            - x (np.ndarray): The positions of the cells.
+            - p (np.ndarray): The apicobasal polarities of the cells.
+            - q (np.ndarray): The planar cell polarities of the cells
+            - alpha_par (np.ndarray): The parallel alpha parameter for each cell.
+            - alpha_perp (np.ndarray): The perpendicular alpha parameter for each cell.
+            - gamma_par (np.ndarray): The parallel gamma (elongation) parameter for each cell.
+            - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
+    """
+
+    # Generate random positions on a cylinder
+    theta = np.random.rand(N) * 2 * np.pi
+    z = np.random.rand(N) * length - length/2  # Random z values between -length/2 and length/2
+    x = np.zeros((N, 3))
+    x[:, 0] = radius * np.cos(theta)
+    x[:, 1] = radius * np.sin(theta)
+    x[:, 2] = z
+
+    # Generate apicobasal polarities pointing radially outward
+    p = np.zeros_like(x)
+    p[:, 0] = np.cos(theta)
+    p[:, 1] = np.sin(theta)
+
+    # Generate planar cell polarities pointing around the cylinder
+    q = np.zeros_like(x)
+    q[:, 0] = -np.sin(theta)
+    q[:, 1] = np.cos(theta)
+    q[:, 2] = 0
+    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+
+    # Generate cell types based on distance from the center
+    mask = np.zeros(N, dtype=int)
+    # All cells in the stretch_frace fraction of the radius from the center are type 1
+    # Sorting cells by their distance from the center
+    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
+    if mirrored:
+        mask[sorted_indices[:int(N*stretch_frac/2)]] = 1
+        mask[sorted_indices[int(N*(1-stretch_frac/2)):]] = 1
+    else:
+        mask[sorted_indices[:int(N*stretch_frac)]] = 1
+    alpha_par = np.zeros(N)
+    alpha_perp = np.zeros(N)
+    gamma = np.zeros(N)
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]       = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+    cylinder_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return cylinder_data
+
+def make_three_particles_on_string(parallel=False,alpha_params=None, gamma_params=None):
+    
+
+    x = np.array([[-2,0,0], [0,0,0], [2,0,0]])
+    p = np.array([[0,1,0], [0,1,0], [0,1,0]])
+    q = np.array([[0,0,1], [0,0,1], [0,0,1]])
+    mask = np.array([0,1,0])                #Mask detailing which cells are which type
+
+    alpha_par = np.zeros(3)
+    alpha_perp = np.zeros(3)
+    gamma = np.zeros(3)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]        = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+
+    string_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return string_data
+
+
+def make_4cells_on_string(mask=None, alpha_params=None, gamma_params=None):
+    x = np.array([[-3,0,0], [-1,0,0], [1,0,0], [3,0,0]])
+    p = np.array([[0,1,0], [0,1,0], [0,1,0], [0,1,0]])
+    q = np.array([[0,0,1], [0,0,1], [0,0,1], [0,0,1]])
+    if mask is None:
+        print('We doing mixed types')
+        mask = np.array([1,0,1,0])                
+
+    alpha_par = np.zeros(4)
+    alpha_perp = np.zeros(4)
+    gamma = np.zeros(4)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]        = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+
+    string_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return string_data

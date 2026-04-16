@@ -1284,6 +1284,7 @@ class DataVizGUI(QMainWindow):
         self.voronoi_enabled = False
         self.voronoi_transparency = 0.5
         self.voronoi_force_recalc = False
+        self.voronoi_progress = None
         self.selected_cell_idx = None
         self._scalar_log_eps = 1e-12
         self.show_scalar_histogram = False
@@ -1577,13 +1578,6 @@ class DataVizGUI(QMainWindow):
             self.voronoi_force_recalc_check = QCheckBox("Force Recalculation (next enable)")
             self.voronoi_force_recalc_check.setChecked(False)
             vor_layout.addWidget(self.voronoi_force_recalc_check)
-
-            # Progress bar (hidden by default)
-            self.voronoi_progress = QProgressDialog("Pre-computing Voronoi...", None, 0, 100)
-            self.voronoi_progress.setAutoClose(True)
-            self.voronoi_progress.setAutoReset(True)
-            self.voronoi_progress.setWindowModality(Qt.WindowModality.WindowModal)
-            self.voronoi_progress.setVisible(False)
 
             layout.addWidget(vor_group)
 
@@ -2090,6 +2084,16 @@ class DataVizGUI(QMainWindow):
         from PyQt6.QtGui import QPixmap, QImage
         import matplotlib.colors as mcolors
 
+        # Guard against degenerate / inverted ranges
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = -1.0, 1.0
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        if abs(vmax - vmin) < 1e-12:
+            pad = 1e-6 if abs(vmin) < 1e-6 else abs(vmin) * 1e-6
+            vmin -= pad
+            vmax += pad
+
         # Build a ListedColormap matching the 3-point scalar_to_rgba gradient
         n = 256
         t = np.linspace(0.0, 1.0, n)
@@ -2104,7 +2108,12 @@ class DataVizGUI(QMainWindow):
         use_center = self._is_logspace_scalar(key)
         vcenter = self._scalar_vcenter(key)
 
-        if use_center and vcenter is not None:
+        # TwoSlopeNorm requires strict ordering: vmin < vcenter < vmax
+        can_use_two_slope = (
+            use_center and vcenter is not None and (vmin < vcenter < vmax)
+        )
+
+        if can_use_two_slope:
             norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
         else:
             norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
@@ -2120,9 +2129,13 @@ class DataVizGUI(QMainWindow):
             cb.set_label(f"{key} (log scale)", color="#e0e0f0", fontsize=10)
             lo_tick = vmin
             hi_tick = vmax
-            mid_tick = vcenter
-            ticks = [lo_tick, mid_tick, hi_tick]
-            labels = [f"{np.exp(lo_tick):.3g}", "1.0", f"{np.exp(hi_tick):.3g}"]
+            if can_use_two_slope:
+                mid_tick = vcenter
+                ticks = [lo_tick, mid_tick, hi_tick]
+                labels = [f"{np.exp(lo_tick):.3g}", "1.0", f"{np.exp(hi_tick):.3g}"]
+            else:
+                ticks = [lo_tick, hi_tick]
+                labels = [f"{np.exp(lo_tick):.3g}", f"{np.exp(hi_tick):.3g}"]
             cb.set_ticks(ticks)
             cb.set_ticklabels(labels)
         else:
@@ -2460,10 +2473,17 @@ class DataVizGUI(QMainWindow):
 
         animator = self.canvas_widget.voronoi_animator
 
+        # Lazily create progress dialog only when computation is explicitly started
+        if self.voronoi_progress is None:
+            self.voronoi_progress = QProgressDialog("Pre-computing Voronoi...", None, 0, 100, self)
+            self.voronoi_progress.setAutoClose(True)
+            self.voronoi_progress.setAutoReset(True)
+            self.voronoi_progress.setWindowModality(Qt.WindowModality.WindowModal)
+
         # Show progress dialog
-        self.voronoi_progress.setVisible(True)
         self.voronoi_progress.setMaximum(nframes)
         self.voronoi_progress.setValue(0)
+        self.voronoi_progress.show()
 
         def on_progress(t, n):
             self.voronoi_progress.setValue(t - start_ts + 1)
