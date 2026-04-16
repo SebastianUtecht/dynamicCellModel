@@ -1,1 +1,4 @@
+# Ignore big data dump
 /data
+# Ignore any directory whose name contains "TESTING" (at any depth)
+**/*TESTING*/

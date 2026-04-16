@@ -78,7 +78,6 @@ class Simulation:
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
-        # self.offsets        = torch.tensor(sim_dict['offsets'], device=self.device, dtype=self.dtype)
         self.interaction_dist = sim_dict['interaction_dist']      # Maximum distance for interactions. Should be larger than r0, but not too large to avoid memory issues
         self.seethru        = 0
         self.cell_wall_interaction = sim_dict['cell_wall_interaction']  # 0 if only repulsion, otherwise up to 1 for attraction
@@ -91,6 +90,14 @@ class Simulation:
             self.get_neighbors = self.get_neighbors_knear
         else:
             raise ValueError("neighbour_type should be either 'voronoi' or 'knear'")
+        
+        self.elong_func_type = sim_dict['elong_func_type']
+        if self.elong_func_type == 'linear':
+            self.elong_func = self.elong_func_linear
+        elif self.elong_func_type == 'sin':
+            self.elong_func = self.elong_func_sin
+        else:
+            raise ValueError("elong_func_type should be either 'linear' or 'sin'")
         
         self.use_q_mean = sim_dict['use_q_mean']
 
@@ -141,6 +148,17 @@ class Simulation:
         # Set random seed
         torch.manual_seed(self.random_seed)                 # For reproducibility
         self.tstep = 0
+
+    def elong_func_linear(self, q_mean, dx):
+        dot = (q_mean * dx).sum(dim=2)
+        dot = torch.abs(dot)
+        elong =  2*torch.arccos(dot) / np.pi
+        return elong
+    
+    def elong_func_sin(self, q_mean, dx):
+        return 1 - (q_mean * dx).sum(dim=2)**2
+    
+
     
     def calculate_area(self, ri_tilde, q, p, z_mask):
         # Using the formula A = 0.5 * sum(|r_{ij} x r_{ij+1}|) where r_{ij} is the vector from cell i to its j-th neighbor.
@@ -202,7 +220,26 @@ class Simulation:
 
         return A
 
-        # CONTINUE HERE. We need correct ordering and only including true neighbors. Furthermore, we should maybe include p and q to get the right basis?
+    def get_transform_exponent(self, q_mean, dx, idx, gamma_par, gamma_perp, wall_mask):
+        gamma_par_i = gamma_par[:, None].expand(gamma_par.shape[0], idx.shape[1])
+        gamma_par_j = gamma_par[idx]
+        gamma_par_i_exp = torch.exp(gamma_par_i)
+        gamma_par_j_exp = torch.exp(gamma_par_j)
+        gamma_par_mean = (gamma_par_i_exp + gamma_par_j_exp)/2 
+        gamma_par_mean = torch.log(gamma_par_mean)
+
+        gamma_perp_i = gamma_perp[:, None].expand(gamma_perp.shape[0], idx.shape[1])
+        gamma_perp_j = gamma_perp[idx]
+        gamma_perp_i_exp = torch.exp(gamma_perp_i)
+        gamma_perp_j_exp = torch.exp(gamma_perp_j)
+        gamma_perp_mean = (gamma_perp_i_exp + gamma_perp_j_exp)/2 
+        gamma_perp_mean = torch.log(gamma_perp_mean)
+        
+        elong = self.elong_func(q_mean, dx)
+        exponent = gamma_par_mean * (1-elong) + gamma_perp_mean * (elong)
+        exponent[wall_mask] = 0.0
+        return torch.exp(exponent)
+
 
     @staticmethod
     def find_potential_neighbours(x, k):
@@ -264,31 +301,24 @@ class Simulation:
 
     def find_true_neighbours(self, d, dx, idx, p, q, gamma_par, gamma_perp, test_batches=True):
         with torch.no_grad():
+            
+            qi = q[:, None, :].expand(q.shape[0], d.shape[1], 3)
+            if self.use_q_mean:
+                qj = q[idx]
+                q_mean = (qi + qj)
+                q_mean = q_mean / torch.sqrt(torch.sum(q_mean**2, dim=2))[:,:,None]
+            else:
+                q_mean = qi
 
-            pi = p[:, None, :].expand(p.shape[0], idx.shape[1], 3)
+            pi = p[:, None, :].expand(p.shape[0], d.shape[1], 3)
             pj = p[idx]
-            qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
-            qj = q[idx]
+            wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)
 
-            e_p, e_q, e_perp = self._build_orthonormal_frame(pi, pj, qi, qj)
-
-            gamma_par_i = gamma_par[:, None].expand(gamma_par.shape[0], idx.shape[1])
-            gamma_par_j = gamma_par[idx]
-            gamma_par_scale = 0.5 * (torch.exp(gamma_par_i) + torch.exp(gamma_par_j))
-
-            gamma_perp_i = gamma_perp[:, None].expand(gamma_perp.shape[0], idx.shape[1])
-            gamma_perp_j = gamma_perp[idx]
-            gamma_perp_scale = 0.5 * (torch.exp(gamma_perp_i) + torch.exp(gamma_perp_j))
-
-            dx_normed = dx / (d[:, :, None] + 1e-8)
-
-            Z_gamma_par = gamma_par_scale[:, :, None] * (e_q * dx_normed).sum(dim=2)[:, :, None] * e_q
-            Z_gamma_perp = gamma_perp_scale[:, :, None] * (e_perp * dx_normed).sum(dim=2)[:, :, None] * e_perp
-            dx_tilde = d[:, :, None] * (Z_gamma_par + Z_gamma_perp + (e_p * dx_normed).sum(dim=2)[:, :, None] * e_p)
-            d_tilde = torch.linalg.norm(dx_tilde, dim=2)
-
-            # dx_tilde = dx
-            # d_tilde = d
+            dx_normed = dx / (torch.linalg.norm(dx, dim=2, keepdim=True) + 1e-8)
+            
+            exponent = self.get_transform_exponent(q_mean, dx_normed, idx, gamma_par, gamma_perp, wall_mask)
+            d_tilde = d * exponent
+            dx_tilde = dx * exponent[:,:,None]
 
             total_cells = dx.shape[0]
             neighbor_count = dx.shape[1]
@@ -470,43 +500,6 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
 
-    def _build_orthonormal_frame(self, pi, pj, qi, qj, eps=1e-8):
-        # Raw means (or i-only) for pair-local frame construction
-        if self.use_q_mean:
-            p_raw = pi + pj
-            q_raw = qi + qj
-        else:
-            p_raw = pi
-            q_raw = qi
-
-        # e_p: unit ABP axis
-        e_p = p_raw / (torch.linalg.norm(p_raw, dim=2, keepdim=True) + eps)
-
-        # Project q onto plane orthogonal to e_p
-        q_proj = q_raw - (q_raw * e_p).sum(dim=2, keepdim=True) * e_p
-        q_proj_norm = torch.linalg.norm(q_proj, dim=2, keepdim=True)
-
-        # Robust fallback if q_raw || e_p
-        ex = torch.zeros_like(e_p)
-        ex[..., 0] = 1.0
-        ey = torch.zeros_like(e_p)
-        ey[..., 1] = 1.0
-
-        q_fallback = torch.cross(e_p, ex, dim=2)
-        q_fallback_norm = torch.linalg.norm(q_fallback, dim=2, keepdim=True)
-        q_fallback2 = torch.cross(e_p, ey, dim=2)
-        q_fallback = torch.where(q_fallback_norm > 1e-6, q_fallback, q_fallback2)
-
-        q_proj = torch.where(q_proj_norm > 1e-6, q_proj, q_fallback)
-
-        # e_q: unit PCP-in-plane axis
-        e_q = q_proj / (torch.linalg.norm(q_proj, dim=2, keepdim=True) + eps)
-
-        # e_perp: completes right-handed orthonormal frame
-        e_perp = torch.cross(e_q, e_p, dim=2)
-        e_perp = e_perp / (torch.linalg.norm(e_perp, dim=2, keepdim=True) + eps)
-
-        return e_p, e_q, e_perp
 
     def potential(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, d, dx, idx, z_mask):
         """
@@ -597,33 +590,9 @@ class Simulation:
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
 
-        # My way of gamma
-        gamma_par_i = gamma_par[:, None].expand(gamma_par.shape[0], idx.shape[1])
-        gamma_par_j = gamma_par[idx]
-        gamma_par_i_exp = torch.exp(gamma_par_i)
-        gamma_par_j_exp = torch.exp(gamma_par_j)
-        gamma_par_mean = (gamma_par_i_exp + gamma_par_j_exp)/2 
-        gamma_par_mean = torch.log(gamma_par_mean)
-
-        gamma_perp_i = gamma_perp[:, None].expand(gamma_perp.shape[0], idx.shape[1])
-        gamma_perp_j = gamma_perp[idx]
-        gamma_perp_i_exp = torch.exp(gamma_perp_i)
-        gamma_perp_j_exp = torch.exp(gamma_perp_j)
-        gamma_perp_mean = (gamma_perp_i_exp + gamma_perp_j_exp)/2 
-        gamma_perp_mean = torch.log(gamma_perp_mean)
-        
-        Z_gamma_par = torch.exp(gamma_par_mean[:,:,None]) * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean
-        Z_gamma_perp = torch.exp(gamma_perp_mean[:,:,None]) * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir
-        ri_tilde = d[:,:,None] * (Z_gamma_par + Z_gamma_perp + (p_mean * dx).sum(dim=2)[:,:,None] * p_mean)
-        d_tilde = torch.linalg.norm(ri_tilde, dim=2)
-
-        # print(torch.exp(gamma_par_mean[:,:,None]))
-        # print(torch.exp(gamma_perp_mean[:,:,None]))
-
-        # d_tilde = d
-        # ri_tilde = dx * d[:,:,None]
+        exponent = self.get_transform_exponent(q_mean, dx, idx, gamma_par, gamma_perp, wall_mask)
+        d_tilde = d * exponent
     
-
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
         S2 = torch.sum(torch.cross(pi_tilde, qi, dim=2) * torch.cross(pj_tilde, qj, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
@@ -655,14 +624,37 @@ class Simulation:
             Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val
         
         Vij_sum = torch.sum(Vij)
-
-        with torch.no_grad():
-            Ai = self.calculate_area(ri_tilde, q, p, z_mask)
         
-        # if self.penalize_A:
-        #     A_penalty = self.penalize_A * (Ai - self.target_A)**2
-        #     # A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
-        #     Vij_sum += A_penalty.sum()
+        with torch.no_grad():
+            Ai = self.calculate_area(dx * d[:,:,None], q, p, z_mask)
+        
+        # z_mask_float = z_mask.to(d.dtype)
+        # valid_counts = torch.sum(z_mask_float, dim=1).clamp(min=1.0)
+        # log_d_tilde = torch.log(torch.clamp(d / exponent, min=1e-8))
+        # mean_log_d_tilde = torch.sum(log_d_tilde * z_mask_float, dim=1) / valid_counts
+        # dists_geometric_mean = torch.exp(mean_log_d_tilde)
+
+        valid_counts = torch.sum(z_mask, dim=1).clamp(min=1.0)
+        with torch.no_grad():
+            d_eff = d.clone().detach()
+        d_eff = d / exponent
+        d_eff_product = torch.prod(d_eff ** z_mask.float(), dim=1)
+        dists_geometric_mean = d_eff_product ** (1.0 / valid_counts)
+
+        # valid_counts = torch.sum(z_mask, dim=1).clamp(min=1.0)
+        # log_exponent = torch.log(torch.clamp(exponent, min=1e-8))
+        # mean_log_d_tilde = torch.sum(log_exponent * z_mask.float(), dim=1) / valid_counts
+        # exponent_geometric_mean = torch.exp(mean_log_d_tilde)
+
+
+        # Geometric mean of exponents with masking
+        if self.penalize_A:
+            A_penalty = self.penalize_A * (self.r0 - dists_geometric_mean)**2
+            # A_penalty = self.penalize_A * (gamma_par + gamma_perp)**2  
+            # A_penalty = self.penalize_A * (1 - exponent_geometric_mean)**2
+            # A_penalty = self.penalize_A * (Ai - self.target_A)**2
+            # A_penalty = self.penalize_A * (1 - torch.exp(gamma_par) * torch.exp(gamma_perp))**2
+            Vij_sum += A_penalty.sum()
 
 
         if self.tstep > 1_000:
@@ -675,12 +667,13 @@ class Simulation:
 
         V = Vij_sum + bc + stretch
 
-        num_neighbors = torch.sum(z_mask, dim=1)           
-        Vij_normed = Vij / num_neighbors[:, None]       
-        Vij_normed[~z_mask] = 0.0
-        Vi = torch.sum(Vij_normed, dim=1)
+        with torch.no_grad():
+            num_neighbors = torch.sum(z_mask, dim=1)           
+            Vij_normed = Vij / num_neighbors[:, None]       
+            Vij_normed[~z_mask] = 0.0
+            Vi = torch.sum(Vij_normed, dim=1)
 
-        return V , Vi, Ai
+        return V , Vi, Ai, dists_geometric_mean
 
     def init_simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -770,7 +763,7 @@ class Simulation:
         d, dx, idx, z_mask = self.get_neighbors(x, p, q, gamma_par, gamma_perp, k=self.k)
   
         # Calculate potential
-        V, Vi, Ai = self.potential(x, p, q, p_mask,
+        V, Vi, Ai, dists_geometric_mean = self.potential(x, p, q, p_mask,
                             alpha_par, alpha_perp, gamma_par, gamma_perp,
                             d, dx, idx, z_mask)
 
@@ -819,7 +812,7 @@ class Simulation:
             p /= torch.sqrt(torch.sum(p ** 2, dim=1))[:, None]          # Normalizing p. Only the non-zero polarities are considered.
             q /= torch.sqrt(torch.sum(q ** 2, dim=1))[:, None]          # Normalizing q. Only the non-zero polarities are considered.
 
-        return x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, Vi, Ai  #Returning the goods.
+        return x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, Vi, Ai, dists_geometric_mean  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -843,7 +836,7 @@ class Simulation:
 
         tstep = 0
         while True:
-            x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, energy, area = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, tstep)        #Advancing the simulation one timestep
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, energy, area, dists_geometric_mean = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp, tstep)        #Advancing the simulation one timestep
             
             tstep += 1
             self.tstep = tstep
@@ -868,9 +861,10 @@ class Simulation:
 
                 energy = energy.detach().to("cpu").numpy().copy()
                 area = area.detach().to("cpu").numpy().copy()
+                dists_geometric_mean = dists_geometric_mean.detach().to("cpu").numpy().copy()
                 pp_mask = p_mask.detach().to("cpu").numpy().copy()
                 
-                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma_par, gammagamma_perp, energy, area                                  # Yielding the data baybeeee
+                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma_par, gammagamma_perp, energy, area, dists_geometric_mean                                  # Yielding the data baybeeee
     
     def cell_division(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma_par, gamma_perp):
         """
@@ -1045,14 +1039,14 @@ def save(data_tuple, name, output_folder):
     Saves the simulation data to a pickle file with dict structure.
 
     Parameters:
-        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst)
+        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst, dists_geometric_mean_lst)
         name (str): The name of the file (without extension).
         output_folder (str): The folder to save the file in.
 
     Returns:
         None, but saves the data
     """
-    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst = data_tuple
+    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst, dists_geometric_mean_lst = data_tuple
 
     energy_lst_copy = energy_lst.copy()
     last_energy = np.zeros_like(p_mask_lst[-1])
@@ -1061,6 +1055,10 @@ def save(data_tuple, name, output_folder):
     area_lst_copy = area_lst.copy()
     last_area = np.zeros_like(p_mask_lst[-1])
     area_lst_copy.append(last_area)
+
+    dists_geometric_mean_lst_copy = dists_geometric_mean_lst.copy()
+    last_dists_geometric_mean = np.zeros_like(p_mask_lst[-1])
+    dists_geometric_mean_lst_copy.append(last_dists_geometric_mean)
 
     # Structure: query by variable name to get list across all timeframes
     data_dict = {
@@ -1073,7 +1071,8 @@ def save(data_tuple, name, output_folder):
         'gamma_par': gamma_par_lst,
         'gamma_perp': gamma_perp_lst,
         'energy': energy_lst_copy,
-        'area': area_lst_copy
+        'area': area_lst_copy,
+        'dists_geometric_mean': dists_geometric_mean_lst_copy
     }
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
@@ -1176,6 +1175,7 @@ def run_simulation(sim_dict):
     gamma_perp_lst = [np.exp(gamma_perp)]
     energy_lst = []
     area_lst = []
+    dists_geometric_mean_lst = []
 
     # we make an initial energy
 
@@ -1185,7 +1185,7 @@ def run_simulation(sim_dict):
         json.dump(sim_dict, f, indent = 2)
 
     # Save the initial simulation data
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst, dists_geometric_mean_lst), name='data', output_folder=output_folder)
 
     # Print the notes if verbose
     if verbose:
@@ -1197,7 +1197,7 @@ def run_simulation(sim_dict):
     t1 = time() # We timing stuff
 
     # Saving data at intervals specified by yield_every:
-    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gamma_parpar, gamma_perpperp, energyenergy, areaarea in itertools.islice(runner, yield_steps):
+    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gamma_parpar, gamma_perpperp, energyenergy, areaarea, dists_geometric_mean_values in itertools.islice(runner, yield_steps):
         i += 1
         if verbose:
             print(f'Running {i} of {yield_steps}   ({yield_every * i} of {yield_every * yield_steps})   ({len(xx)} cells)', end='\r')
@@ -1212,19 +1212,20 @@ def run_simulation(sim_dict):
         gamma_perp_lst.append(gamma_perpperp)
         energy_lst.append(energyenergy)
         area_lst.append(areaarea)
+        dists_geometric_mean_lst.append(dists_geometric_mean_values)
         
         if len(pp_mask) > sim_dict['max_cells']:
             break
         
         # Every 50 yield steps we dump the data
         if i % 50 == 0:
-            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)
+            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst, dists_geometric_mean_lst), name='data', output_folder=output_folder)
     
     if verbose:
         print(f'Simulation done, saved {i} datapoints')
         print('Took', time() - t1, 'seconds')
 
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst), name='data', output_folder=output_folder)  # Last iteration is saved
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_par_lst, gamma_perp_lst, energy_lst, area_lst, dists_geometric_mean_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
 def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
     """
