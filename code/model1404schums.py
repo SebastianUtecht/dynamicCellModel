@@ -71,14 +71,10 @@ class Simulation:
         self.bound_cur_ext      = self.bound_extents[0] if self.bound_move_times is not None else None # Current extent of the boundary. Only relevant if bound_move_times is not None
 
         # Stretching parameters
-        self.stretch_factor     = sim_dict['stretch_factor']        # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
-        self.stretch_stop_ext   = sim_dict['stretch_stop_ext']      # The extent at which the stretch stops. Only relevant if stretch_factor is not 0
-        self.stretch_time_stop = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
-        self.just_move_bool     = sim_dict['just_move_bool']        # Whether to just move the cells according to the stretching without applying any of the other forces. Useful for debugging the stretching implementation
+        self.stretch_factor     = sim_dict['stretch_factor']     # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
+        self.stretch_stop_ext   = sim_dict['stretch_stop_ext']   # The extent at which the stretch stops. Only relevant if stretch_factor is not 0
+        self.just_move_bool     = sim_dict['just_move_bool']     # Whether to just move the cells according to the stretching without applying any of the other forces. Useful for debugging the stretching implementation
 
-        # Both stretch and bound
-        self.stretch_bound_axis = sim_dict['stretch_bound_axis'] # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
-        
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
@@ -142,109 +138,14 @@ class Simulation:
         torch.manual_seed(self.random_seed)                 # For reproducibility
         self.tstep = 0
     
-    #Checked
     def elong_func_linear(self, q_mean, dx):
         dot = (q_mean * dx).sum(dim=2)
         dot = torch.abs(dot)
         elong =  1 - 4/np.pi * torch.arccos(dot)
         return elong
     
-    #Checked
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
-
-    def safe_normalize(self, v, dim=-1, eps: float = 1e-12):
-        """Normalise vectors safely (avoids NaNs when norm is ~0)."""
-        n = torch.linalg.norm(v, dim=dim, keepdim=True)
-        return v / torch.clamp(n, min=eps)
-
-    def rotation_matrices_axis_angle(self, axis, angle, eps: float = 1e-12):
-        """Create rotation matrices from axis-angle (Rodrigues)
-
-        Parameters:
-            axis: (..., 3) rotation axes
-            angle: (...) rotation angles (radians)
-        Returns:
-            R: (..., 3, 3)
-        """
-
-        axis_norm = torch.linalg.norm(axis, dim=-1)
-        valid = axis_norm > eps
-
-        # Normalised axis; value doesn't matter where invalid because angle will be zeroed.
-        u = axis / torch.clamp(axis_norm, min=eps)[..., None]
-        angle = angle * valid.to(angle.dtype)
-
-        ux, uy, uz = u.unbind(dim=-1)
-        zero = torch.zeros_like(ux)
-
-        K = torch.stack(
-            (
-                torch.stack((zero, -uz, uy), dim=-1),
-                torch.stack((uz, zero, -ux), dim=-1),
-                torch.stack((-uy, ux, zero), dim=-1),
-            ),
-            dim=-2,
-        )
-
-        I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand(axis.shape[:-1] + (3, 3))
-
-        theta = angle[..., None, None]
-        c = torch.cos(theta)
-        s = torch.sin(theta)
-        one_minus_c = 1.0 - c
-
-        uuT = u[..., :, None] * u[..., None, :]
-        R = c * I + one_minus_c * uuT + s * K
-        return R
-
-    def rotate_vectors_axis_angle(self, v, axis, angle, eps: float = 1e-12):
-        """Rotate vectors v by axis-angle (batch/broadcast friendly)."""
-        R = self.rotation_matrices_axis_angle(axis, angle, eps=eps)
-        return torch.einsum('...ij,...j->...i', R, v)
-
-    def quat_from_axis_angle(self, axis, angle, eps: float = 1e-12):
-        """Axis-angle to unit quaternion.
-
-        Parameters:
-            axis: (..., 3) rotation axis (need not be normalised)
-            angle: (...) rotation angle (radians)
-        Returns:
-            q: (..., 4) quaternion as [w, x, y, z]
-        """
-        axis_norm = torch.linalg.norm(axis, dim=-1)
-        valid = axis_norm > eps
-        u = axis / torch.clamp(axis_norm, min=eps)[..., None]
-        angle = angle * valid.to(angle.dtype)
-
-        half = 0.5 * angle
-        w = torch.cos(half)
-        s = torch.sin(half)[..., None]
-        xyz = u * s
-        return torch.cat((w[..., None], xyz), dim=-1)
-
-    @staticmethod
-    def quat_mul(q1, q2):
-        """Hamilton product q = q1 ⊗ q2 for quaternions [w, x, y, z]."""
-        w1, x1, y1, z1 = q1.unbind(dim=-1)
-        w2, x2, y2, z2 = q2.unbind(dim=-1)
-        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-        return torch.stack((w, x, y, z), dim=-1)
-
-    @staticmethod
-    def quat_rotate(q, v):
-        """Rotate vectors v by unit quaternion q (both broadcastable).
-
-        q: (..., 4) [w, x, y, z]
-        v: (..., 3)
-        """
-        w = q[..., :1]
-        qv = q[..., 1:]
-        t = 2.0 * torch.cross(qv, v, dim=-1)
-        return v + w * t + torch.cross(qv, t, dim=-1)
 
 
     @staticmethod
@@ -304,45 +205,32 @@ class Simulation:
         if self.device == "cuda":
             torch.cuda.empty_cache()
 
-    def get_gamma_exponent(self, dx, pi, pj, q_mean, idx, gamma):
+    def get_gamma_exponent(self, dx, pi, pj, qi, qj, idx, gamma):
 
         wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)
 
         gamma_i = gamma[:, None].expand(gamma.shape[0], idx.shape[1])
         gamma_j = gamma[idx]
-        if self.use_gamma_mean:
-            gamma_mean = torch.log((torch.exp(gamma_i) + torch.exp(gamma_j))/2)
-        else:
-            gamma_mean = gamma_i
+        elong_i = self.elong_func(qi, dx)
+        elong_j = self.elong_func(qj, dx)
+        gamma_mean = torch.log((torch.exp(gamma_i * elong_i) + torch.exp(gamma_j * elong_j))/2)
 
-        elong = self.elong_func(q_mean, dx)
-
-        exponent = gamma_mean * elong
+        exponent = gamma_mean
         exponent[wall_mask] = 0.0
 
         return exponent, gamma_i, gamma_j
     
     def get_neighbors_vor(self, x, p, q, gamma, k):
-        self.refresh_potential_neighbours_once(x, k)
-        return self.true_neighbours_from_idx(x, p, q, gamma, self.idx)
-
-    def refresh_potential_neighbours_once(self, x, k):
-        """Refreshes the cached potential-neighbour list at most once per timestep."""
         if self.update_neighbors_bool():
             self.d, self.idx = self.find_potential_neighbours(x, k)
+        d = self.d
+        idx = self.idx
 
-    def true_neighbours_from_idx(self, x, p, q, gamma, idx):
-        """Builds true neighbours (Voronoi filter + trimming) from a provided potential-neighbour idx list.
-
-        This is intentionally side-effect free with respect to neighbour caching, so it can be used
-        multiple times within a single timestep (e.g. predictor/corrector) without triggering KDTree.
-        """
-
-        # Find neighbours from provided idx
+        # Find neighbours
         full_n_list = x[idx]
         dx = x[:, None, :] - full_n_list
         d = torch.sqrt(torch.sum(dx**2, dim=2))
-        z_mask = self.find_true_neighbours(d, dx, idx, p, q, gamma)
+        z_mask = self.find_true_neighbours(d, dx, idx,  p, q, gamma)
 
         # Minimize size of z_mask and reorder idx and dx
         sort_idx = torch.argsort(z_mask.int(), dim=1, descending=True)
@@ -364,16 +252,11 @@ class Simulation:
         with torch.no_grad():
             # Expanding ABP and PCP
             qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
-            if self.use_q_mean:
-                qj = q[idx]
-                q_mean = (qi + qj)
-                q_mean = self.safe_normalize(q_mean, dim=2)
-            else:
-                q_mean = qi
+            qj = q[idx]
             pi = p[:, None, :].expand(p.shape[0], idx.shape[1], 3)
             pj = p[idx]
             
-            exponent, _, _ = self.get_gamma_exponent(dx / d[:,:,None], pi, pj, q_mean, idx, gamma)
+            exponent, _, _ = self.get_gamma_exponent(dx / d[:,:,None], pi, pj, qi, qj, idx, gamma)
 
             dx_tilde = dx * torch.exp(exponent)[:,:,None]
             d_tilde  = d * torch.exp(exponent)
@@ -388,7 +271,7 @@ class Simulation:
 
             
             if self.tstep == 0:
-                if test_batches:
+                if test_batches and not hasattr(self, 'max_safe_batch'):
                     self.find_max_safe_batch(total_cells=total_cells)
                 else:
                     self.max_safe_batch = 1024
@@ -418,40 +301,15 @@ class Simulation:
 
         return result_tensor
 
-    def advance_boundary_state(self):
-        """Advance boundary state once per timestep (beginning-of-step)."""
-        if self.bound_type is None or self.bound_move_times is None:
-            return
-        if self.bound_cur_ext is None:
-            return
-        if self.tstep > self.bound_move_times[0] and self.tstep < self.bound_move_times[1]:
-            self.bound_cur_ext += self.bound_speed
-
-    def advance_stretch_state(self, pos, p_mask):
-        """Advance stretch state once per timestep (beginning-of-step).
-
-        This moves any stateful stopping logic out of the potential evaluation so multi-stage
-        integrators do not double-advance it.
-        """
-        if self.stretch_factor == 0.0:
-            return
-        if self.stretch_stop_ext is None:
-            return
-        x_pos = pos[p_mask == 1][:, self.stretch_bound_axis]
-        if x_pos.numel() == 0:
-            return
-        if torch.abs(torch.min(x_pos) - torch.max(x_pos)) > self.stretch_stop_ext:
-            self.stretch_factor = 0.0
-
-    def stretch_energy(self, pos, p_mask):
-        """Pure stretch contribution to the potential energy (no mutation)."""
-        if self.stretch_factor == 0.0:
+    def x_stretch(self, pos, p_mask):
+        if self.stretch_factor == 0.0:  
             return 0.0
-        x_pos = pos[p_mask == 1][:, self.stretch_bound_axis]
-        if x_pos.numel() == 0:
-            return 0.0
-        v_add = -self.stretch_factor * torch.abs(x_pos - self.x_mass_midpoint)
-        return v_add.sum()
+        else:
+            x_pos = pos[p_mask == 1][:,0]    # Stretching in x direction only
+            v_add = -self.stretch_factor * torch.abs(x_pos - self.x_mass_midpoint)
+            if torch.abs(torch.min(x_pos) - torch.max(x_pos)) > self.stretch_stop_ext:   # Stop stretching if we exceed the stretch stop extent
+                self.stretch_factor = 0.0
+            return v_add.sum()
     
     def bound(self, pos):
         if self.bound_type is None:
@@ -467,7 +325,10 @@ class Simulation:
         
     def planes_bound(self, pos):
         
-        bound_dists = torch.abs(pos[:, self.stretch_bound_axis]) - self.bound_cur_ext/2
+        if self.tstep > self.bound_move_times[0] and self.tstep < self.bound_move_times[1]:
+            self.bound_cur_ext += self.bound_speed
+
+        bound_dists = torch.abs(pos[:,-1]) - self.bound_cur_ext/2
         v_add = torch.where(bound_dists > 0, 2 * bound_dists**2, 0.0)
         if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff.
             print("Warning: NaN or Inf detected in potential energy")
@@ -475,13 +336,11 @@ class Simulation:
         return V_add_sum
     
     def cylinder_bound(self, pos):
-        # cylinder along self.stretch_bound_axis, so we calculate the distance in the plane perpendicular to that axis
-        if self.stretch_bound_axis == 0:
-            bound_dists = torch.sqrt(torch.sum(pos[:, 1:3]**2, dim=1)) - self.bound_cur_ext/2
-        elif self.stretch_bound_axis == 1:
-            bound_dists = torch.sqrt(torch.sum(pos[:, ::2]**2, dim=1)) - self.bound_cur_ext/2
-        else:
-            bound_dists = torch.sqrt(torch.sum(pos[:, :2]**2, dim=1)) - self.bound_cur_ext/2
+
+        if self.tstep > self.bound_move_times[0] and self.tstep < self.bound_move_times[1]:
+            self.bound_cur_ext += self.bound_speed
+
+        bound_dists = torch.sqrt(torch.sum(pos[:,:2]**2, dim=1)) - self.bound_cur_ext/2
         v_add = torch.where(bound_dists > 0, 2 * bound_dists**2, 0.0)
         if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff.
             print("Warning: NaN or Inf detected in potential energy")
@@ -513,6 +372,7 @@ class Simulation:
         S_rescaled = (S + 1.0) / 2.0
         return S_rescaled
 
+    
     def potential(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma, d, dx, idx, z_mask):
         """
         Calculate the potential energy between particles.
@@ -561,70 +421,48 @@ class Simulation:
         qj = q[idx]
         if self.use_q_mean:
             q_mean = (qi + qj)
-            q_mean = self.safe_normalize(q_mean, dim=2)
+            q_mean = q_mean / torch.sqrt(torch.sum(q_mean**2, dim=2))[:,:,None]
         else:
             q_mean = qi
         
         # Expanding alpha_par, alpha_perp
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
         alpha_par_j = alpha_par[idx]
-        alpha_par_mean = (alpha_par_i + alpha_par_j) / 2.0
+        alpha_par_mean = (alpha_par_i + alpha_par_j)/2                  # Minimum wedging determines interaction
+        alpha_par_mean = torch.tan(alpha_par_mean/2)
 
         alpha_perp_i = alpha_perp[:, None].expand(alpha_perp.shape[0], idx.shape[1])
         alpha_perp_j = alpha_perp[idx]
-        alpha_perp_mean = (alpha_perp_i + alpha_perp_j) / 2.0
+        alpha_perp_mean = (alpha_perp_i + alpha_perp_j)/2               # Minimum wedging determines interaction
+        alpha_perp_mean = torch.tan(alpha_perp_mean/2)
 
-        # Implementing cell wedging via rotations (axis-angle)
-        # Each cell rotates by half the mean angle; direction depends on neighbour position.
-        # Convention: if alpha_i == alpha_j == alpha, then each side rotates by alpha/2 (not alpha/4).
-        half_alpha_par = alpha_par_mean
-        half_alpha_perp = alpha_perp_mean
+        # Implementing cell wedging
+        perp_dir = torch.cross(q_mean, pi, dim=2)
+        perp_dir = perp_dir / torch.sqrt(torch.sum(perp_dir**2, dim=2))[:,:,None]
 
-        # Axes
-        q_axis = q_mean
-        perp_axis_i = self.safe_normalize(torch.cross(q_mean, pi, dim=2), dim=2)
-        perp_axis_j = self.safe_normalize(torch.cross(q_mean, pj, dim=2), dim=2)
+        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                    
+        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                
+        Z = Z_par + Z_perp
 
-        # Alignment factors from relative neighbour direction (dx is unit; values in [-1, 1])
-        # Match original implementation:
-        # - alpha_par term was proportional to (q_axis·dx) and tilted along q_axis  -> rotation about perp_axis
-        # - alpha_perp term was proportional to (perp_axis·dx) and tilted along perp_axis -> rotation about q_axis
-        align_q = torch.sum(q_axis * dx, dim=2)
-        align_perp_i = torch.sum(perp_axis_i * dx, dim=2)
-        align_perp_j = torch.sum(perp_axis_j * dx, dim=2)
+        pi_tilde = pi - Z
+        pj_tilde = pj + Z
 
-        # Rotation angles (scale by alignment magnitude)
-        # Rotate about q-axis with alpha_perp, and about perp-axis with alpha_par.
-        theta_perp_i = -half_alpha_perp * align_perp_i
-        theta_perp_j = +half_alpha_perp * align_perp_j
-        theta_par_i = -half_alpha_par * align_q
-        theta_par_j = +half_alpha_par * align_q
-
-        # Compose a single rotation operator per interaction side and apply to both p and q.
-        # Order: first rotate about q-axis (alpha_perp), then about perp-axis (alpha_par).
-        q_perp_i = self.quat_from_axis_angle(q_axis, theta_perp_i)
-        q_perp_j = self.quat_from_axis_angle(q_axis, theta_perp_j)
-        q_par_i = self.quat_from_axis_angle(perp_axis_i, theta_par_i)
-        q_par_j = self.quat_from_axis_angle(perp_axis_j, theta_par_j)
-
-        q_tot_i = self.quat_mul(q_par_i, q_perp_i)
-        q_tot_j = self.quat_mul(q_par_j, q_perp_j)
-
-        pi_tilde = self.quat_rotate(q_tot_i, pi)
-        qi_tilde = self.quat_rotate(q_tot_i, qi)
-        pj_tilde = self.quat_rotate(q_tot_j, pj)
-        qj_tilde = self.quat_rotate(q_tot_j, qj)
+        # Normalizing the ABPs
+        # wedged_interactions = torch.any((alpha_par_mean > 1e-5) | (alpha_perp_mean > 1e-5), dim=2)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        wedged_interactions = torch.logical_or(alpha_par_mean > 1e-5, alpha_perp_mean > 1e-5)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        pi_tilde[wedged_interactions] = pi_tilde[wedged_interactions] / torch.sqrt(torch.sum(pi_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+        pj_tilde[wedged_interactions] = pj_tilde[wedged_interactions] / torch.sqrt(torch.sum(pj_tilde[wedged_interactions] ** 2, dim=1))[:, None]
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
 
-        exponent, gamma_i, gamma_j = self.get_gamma_exponent(dx, pi, pj, q_mean, idx, gamma)
+        exponent, gamma_i, gamma_j = self.get_gamma_exponent(dx, pi, pj, qi, qj, idx, gamma)
         d_tilde = d * torch.exp(exponent)
 
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
-        S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
-        S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
+        S2 = torch.sum(torch.cross(pi_tilde, qi, dim=2) * torch.cross(pj_tilde, qj, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
+        S3 = torch.sum(torch.cross(qi, dx, dim=2) * torch.cross(qj, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
 
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
@@ -651,12 +489,9 @@ class Simulation:
                 Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val 
 
         if self.cell_wall_interaction == 0.0:
-            with torch.no_grad():
-                dist_mask = d < self.r0
-                too_close_mask = (wall_mask * dist_mask) * z_mask
-                not_close_mask = (wall_mask * (~dist_mask)) * z_mask
-            Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5))# - self.r0_val
-            Vij[not_close_mask] = self.r0_val #0.0
+            dist_mask = d < self.r0
+            too_close_mask = wall_mask * dist_mask
+            Vij[too_close_mask] = (torch.exp(-d[too_close_mask]) - torch.exp(-d[too_close_mask]/5)) - self.r0_val
         
         Vij_sum = torch.sum(Vij)
 
@@ -668,10 +503,10 @@ class Simulation:
             Vij_sum += gamma_diff_sum * self.gamma_diff_penalty
 
         if self.tstep > 1_000:
-            # Boundary conditions
+            # Boundary conditions          
             bc = self.bound(x)
             if not self.just_move_bool:
-                stretch = self.stretch_energy(x, p_mask)
+                stretch = self.x_stretch(x, p_mask)
             else:
                 stretch = 0.0
         else:
@@ -742,27 +577,6 @@ class Simulation:
             return True
         return (self.tstep % 20 == 0)                           # Otherwise we update every 20th step
 
-    def apply_constraints(self, p, q, p_mask, alpha_par, alpha_perp, gamma):
-        """Apply unit-norm and parameter bounds in-place under no_grad."""
-        with torch.no_grad():
-            eps = 1e-12
-            p_norm = torch.sqrt(torch.sum(p ** 2, dim=1))
-            q_norm = torch.sqrt(torch.sum(q ** 2, dim=1))
-            p.div_(torch.clamp(p_norm, min=eps)[:, None])
-            q.div_(torch.clamp(q_norm, min=eps)[:, None])
-
-            # Clamp only the parameters that are free for the given type
-            for i, _ in enumerate(self.eta_lst):
-                mask = p_mask == i
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par[mask] = torch.clamp(alpha_par[mask], self.alpha_range[0], self.alpha_range[1])
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp[mask] = torch.clamp(alpha_perp[mask], self.alpha_range[0], self.alpha_range[1])
-                if self.gamma_bool_lst[i]:
-                    gamma[mask] = torch.clamp(gamma[mask], self.gamma_range[0], self.gamma_range[1])
-
-        return p, q, alpha_par, alpha_perp, gamma
-
     def time_step(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep):
         """
         Progresses the simulation by one time step.
@@ -793,129 +607,54 @@ class Simulation:
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
         # self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
-        # Advance any stateful boundary/stretch logic once per timestep (beginning-of-step).
-        if self.tstep > 1_000:
-            with torch.no_grad():
-                self.advance_boundary_state()
-                if not self.just_move_bool:
-                    self.advance_stretch_state(x, p_mask)
+        d, dx, idx, z_mask = self.get_neighbors(x, p, q, gamma, k=self.k)
+  
+        # Calculate potential
+        V, Vi = self.potential(x, p, q, p_mask,
+                            alpha_par, alpha_perp, gamma,
+                            d, dx, idx, z_mask)
 
-        # Refresh potential neighbours at most once per timestep (KDTree), then reuse idx for both stages.
-        self.refresh_potential_neighbours_once(x, self.k)
-        idx_base = self.idx
+        # Backpropagation
+        V.backward()
 
-        # 
-        d1, dx1, idx1, z_mask1 = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
-        V1, Vi = self.potential(x, p, q, p_mask,
-                                alpha_par, alpha_perp, gamma,
-                                d1, dx1, idx1, z_mask1)
-
-        g1_x, g1_p, g1_q, g1_alpha_par, g1_alpha_perp, g1_gamma = torch.autograd.grad(
-            V1, (x, p, q, alpha_par, alpha_perp, gamma), create_graph=False, retain_graph=False
-        )
-
-        # Shared noise for additive-noise predictor/corrector
         with torch.no_grad():
-            xi_x = torch.empty_like(x).normal_()
-            # Rotational noise for p/q: random axis + small angle (eta is angular std dev in radians)
-            axis_p = self.safe_normalize(torch.empty_like(p).normal_(), dim=1)
-            axis_q = self.safe_normalize(torch.empty_like(q).normal_(), dim=1)
-            xi_theta_p = torch.empty((p.shape[0],), device=self.device, dtype=self.dtype).normal_()
-            xi_theta_q = torch.empty((q.shape[0],), device=self.device, dtype=self.dtype).normal_()
-            xi_alpha_par = torch.empty_like(alpha_par).normal_()
-            xi_alpha_perp = torch.empty_like(alpha_perp).normal_()
+            for i,eta in enumerate(self.eta_lst):
+                if self.update_cells_bools[i]:
+                    x[p_mask == i] += -x.grad[p_mask == i] * self.dt + eta * torch.empty(*x[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                    p[p_mask == i] += -p.grad[p_mask == i] * self.dt + eta * torch.empty(*p[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                    q[p_mask == i] += -q.grad[p_mask == i] * self.dt + eta * torch.empty(*q[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
 
-            # Predictor state
-            x_tilde = x.clone()
-            p_tilde = p.clone()
-            q_tilde = q.clone()
-            alpha_par_tilde = alpha_par.clone()
-            alpha_perp_tilde = alpha_perp.clone()
-            gamma_tilde = gamma.clone()
+                    # Updating alpha and gamma if they are free
+                    if self.alpha_par_bool_lst[i]:
+                        alpha_par[p_mask == i] += -alpha_par.grad[p_mask == i] * self.dt + eta * torch.empty(*alpha_par[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                        alpha_par[p_mask == i] = torch.clamp(alpha_par[p_mask == i], self.alpha_range[0], self.alpha_range[1])
 
-            for i, eta in enumerate(self.eta_lst):
-                if not self.update_cells_bools[i]:
+                    if self.alpha_perp_bool_lst[i]:
+                        alpha_perp[p_mask == i] += -alpha_perp.grad[p_mask == i] * self.dt + eta * torch.empty(*alpha_perp[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt
+                        alpha_perp[p_mask == i] = torch.clamp(alpha_perp[p_mask == i], self.alpha_range[0], self.alpha_range[1])
+
+                    if self.gamma_bool_lst[i]:
+                        gamma[p_mask == i] += self.gamma_update_speed * (-gamma.grad[p_mask == i] * self.dt) #+ eta * torch.empty(*gamma[p_mask == i].shape, dtype=self.dtype, device=self.device).normal_() * self.sqrt_dt)
+                        gamma[p_mask == i] = torch.clamp(gamma[p_mask == i], self.gamma_range[0], self.gamma_range[1])
+                else:
                     continue
-                mask = p_mask == i
 
-                x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p_tilde[mask] += (-g1_p[mask] * self.dt)
-                q_tilde[mask] += (-g1_q[mask] * self.dt)
+        # We zero out the gradients for next time step
+        if any(self.alpha_par_bool_lst):
+            alpha_par.grad.zero_()
+        if any(self.alpha_perp_bool_lst):
+            alpha_perp.grad.zero_()
+        if any(self.gamma_bool_lst):
+            gamma.grad.zero_()
 
-                theta_p = (eta * xi_theta_p[mask] * self.sqrt_dt)
-                theta_q = (eta * xi_theta_q[mask] * self.sqrt_dt)
-                p_tilde[mask] = self.rotate_vectors_axis_angle(p_tilde[mask], axis_p[mask], theta_p)
-                q_tilde[mask] = self.rotate_vectors_axis_angle(q_tilde[mask], axis_q[mask], theta_q)
-
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
-
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
-
-                if self.gamma_bool_lst[i]:
-                    gamma_tilde[mask] += self.gamma_update_speed * (-g1_gamma[mask] * self.dt)
-
-            # Apply constraints before stage 2 drift evaluation
-            p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde = self.apply_constraints(
-                p_tilde, q_tilde, p_mask, alpha_par_tilde, alpha_perp_tilde, gamma_tilde
-            )
-
-        # Make predictor state leaf tensors for stage-2 grad evaluation
-        x_tilde.requires_grad_(True)
-        p_tilde.requires_grad_(True)
-        q_tilde.requires_grad_(True)
-        alpha_par_tilde.requires_grad_(True)
-        alpha_perp_tilde.requires_grad_(True)
-        gamma_tilde.requires_grad_(True)
-
-        # ------------------------
-        # Stage 2 (drift at X~)
-        # ------------------------
-        d2, dx2, idx2, z_mask2 = self.true_neighbours_from_idx(x_tilde, p_tilde, q_tilde, gamma_tilde, idx_base)
-        V2, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
-                               alpha_par_tilde, alpha_perp_tilde, gamma_tilde,
-                               d2, dx2, idx2, z_mask2)
-
-        g2_x, g2_p, g2_q, g2_alpha_par, g2_alpha_perp, g2_gamma = torch.autograd.grad(
-            V2, (x_tilde, p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde),
-            create_graph=False, retain_graph=False
-        )
-
-        # ------------------------
-        # Corrector (Heun)
-        # ------------------------
-        with torch.no_grad():
-            for i, eta in enumerate(self.eta_lst):
-                if not self.update_cells_bools[i]:
-                    continue
-                mask = p_mask == i
-
-                x[mask] += (-0.5 * (g1_x[mask] + g2_x[mask]) * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p[mask] += (-0.5 * (g1_p[mask] + g2_p[mask]) * self.dt)
-                q[mask] += (-0.5 * (g1_q[mask] + g2_q[mask]) * self.dt)
-
-                theta_p = (eta * xi_theta_p[mask] * self.sqrt_dt)
-                theta_q = (eta * xi_theta_q[mask] * self.sqrt_dt)
-                p[mask] = self.rotate_vectors_axis_angle(p[mask], axis_p[mask], theta_p)
-                q[mask] = self.rotate_vectors_axis_angle(q[mask], axis_q[mask], theta_q)
-
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
-
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
-
-                if self.gamma_bool_lst[i]:
-                    gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt)
-
-            # Final constraints
-            p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
+        p.grad.zero_()
+        q.grad.zero_()
+        x.grad.zero_()
 
         with torch.no_grad():
             if self.just_move_bool and self.stretch_factor != 0.0:   # Just move the second cell type in x direction for stretching purposes. This is used for the control experiment where we want to see the effect of just moving the cells without any change in the potential.
                 x[:,0][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,0] - self.x_mass_midpoint)   # Just move the second cell type in x direction for stretching purposes. This is used for the control experiment where we want to see the effect of just moving the cells without any change in the potential.
-                if self.tstep >= self.stretch_time_stop:
+                if self.tstep >= 600 * 50:
                     self.stretch_factor = 0.0
                     # delete cells for p_mask == 1
                     x = x[p_mask != 1]
@@ -935,6 +674,16 @@ class Simulation:
 
                     self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
                     self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
+
+
+            
+            # if torch.abs(torch.sum(x[:,0][p_mask == 1]) / torch.sum(p_mask == 1) - self.x_mass_midpoint) > self.stretch_stop_ext:   # Stop stretching if we exceed the stretch stop extent. We check the average position of the stretched cells to determine this.
+            #     self.stretch_factor = 0.0
+
+        #normalize p and q after altering them in the update timestep
+        with torch.no_grad():
+            p /= torch.sqrt(torch.sum(p ** 2, dim=1))[:, None]          # Normalizing p. Only the non-zero polarities are considered.
+            q /= torch.sqrt(torch.sum(q ** 2, dim=1))[:, None]          # Normalizing q. Only the non-zero polarities are considered.
 
         return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi  #Returning the goods.
 

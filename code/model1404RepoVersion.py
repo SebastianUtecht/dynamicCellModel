@@ -8,7 +8,6 @@ import pickle
 from time import time
 import json
 
-
 ### Simulation ###
 class Simulation:
     """
@@ -60,6 +59,7 @@ class Simulation:
         self.prolif_delay   = sim_dict['prolif_delay']      # Delay before cell proliferation
         self.nematic_pcp    = sim_dict['nematic_pcp']     # Whether planar cell polarity is nematic (True) or vectorial (False)
         self.update_cells_bools = sim_dict['update_cells_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
+        self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
 
         # Boundary parameters
         self.bound_type         = sim_dict['bound_type']
@@ -197,56 +197,7 @@ class Simulation:
         uuT = u[..., :, None] * u[..., None, :]
         R = c * I + one_minus_c * uuT + s * K
         return R
-
-    def rotate_vectors_axis_angle(self, v, axis, angle, eps: float = 1e-12):
-        """Rotate vectors v by axis-angle (batch/broadcast friendly)."""
-        R = self.rotation_matrices_axis_angle(axis, angle, eps=eps)
-        return torch.einsum('...ij,...j->...i', R, v)
-
-    def quat_from_axis_angle(self, axis, angle, eps: float = 1e-12):
-        """Axis-angle to unit quaternion.
-
-        Parameters:
-            axis: (..., 3) rotation axis (need not be normalised)
-            angle: (...) rotation angle (radians)
-        Returns:
-            q: (..., 4) quaternion as [w, x, y, z]
-        """
-        axis_norm = torch.linalg.norm(axis, dim=-1)
-        valid = axis_norm > eps
-        u = axis / torch.clamp(axis_norm, min=eps)[..., None]
-        angle = angle * valid.to(angle.dtype)
-
-        half = 0.5 * angle
-        w = torch.cos(half)
-        s = torch.sin(half)[..., None]
-        xyz = u * s
-        return torch.cat((w[..., None], xyz), dim=-1)
-
-    @staticmethod
-    def quat_mul(q1, q2):
-        """Hamilton product q = q1 ⊗ q2 for quaternions [w, x, y, z]."""
-        w1, x1, y1, z1 = q1.unbind(dim=-1)
-        w2, x2, y2, z2 = q2.unbind(dim=-1)
-        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-        return torch.stack((w, x, y, z), dim=-1)
-
-    @staticmethod
-    def quat_rotate(q, v):
-        """Rotate vectors v by unit quaternion q (both broadcastable).
-
-        q: (..., 4) [w, x, y, z]
-        v: (..., 3)
-        """
-        w = q[..., :1]
-        qv = q[..., 1:]
-        t = 2.0 * torch.cross(qv, v, dim=-1)
-        return v + w * t + torch.cross(qv, t, dim=-1)
-
-
+    
     @staticmethod
     def find_potential_neighbours(x, k):
 
@@ -377,6 +328,12 @@ class Simulation:
 
             dx_tilde = dx * torch.exp(exponent)[:,:,None]
             d_tilde  = d * torch.exp(exponent)
+
+            if self.screen_out_defects:
+                defect_mask = (torch.sum(qi * qj, dim=2) < 0.7)
+                dx_tilde[defect_mask] = dx[defect_mask]
+                d_tilde[defect_mask] = d[defect_mask]
+
 
             total_cells = dx.shape[0]
             neighbor_count = dx.shape[1]
@@ -562,8 +519,12 @@ class Simulation:
         if self.use_q_mean:
             q_mean = (qi + qj)
             q_mean = self.safe_normalize(q_mean, dim=2)
+
+            p_mean = (pi + pj)
+            p_mean = self.safe_normalize(p_mean, dim=2)
         else:
             q_mean = qi
+            p_mean = pi
         
         # Expanding alpha_par, alpha_perp
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
@@ -577,43 +538,24 @@ class Simulation:
         # Implementing cell wedging via rotations (axis-angle)
         # Each cell rotates by half the mean angle; direction depends on neighbour position.
         # Convention: if alpha_i == alpha_j == alpha, then each side rotates by alpha/2 (not alpha/4).
-        half_alpha_par = alpha_par_mean
-        half_alpha_perp = alpha_perp_mean
+        half_alpha_par = alpha_par_mean / 2.0
+        half_alpha_perp = alpha_perp_mean / 2.0
 
         # Axes
         q_axis = q_mean
-        perp_axis_i = self.safe_normalize(torch.cross(q_mean, pi, dim=2), dim=2)
-        perp_axis_j = self.safe_normalize(torch.cross(q_mean, pj, dim=2), dim=2)
+        perp_axis = self.safe_normalize(torch.cross(q_mean, p_mean, dim=2), dim=2)
 
-        # Alignment factors from relative neighbour direction (dx is unit; values in [-1, 1])
-        # Match original implementation:
-        # - alpha_par term was proportional to (q_axis·dx) and tilted along q_axis  -> rotation about perp_axis
-        # - alpha_perp term was proportional to (perp_axis·dx) and tilted along perp_axis -> rotation about q_axis
-        align_q = torch.sum(q_axis * dx, dim=2)
-        align_perp_i = torch.sum(perp_axis_i * dx, dim=2)
-        align_perp_j = torch.sum(perp_axis_j * dx, dim=2)
+        #Rotation matrices for ABP and PCP
+        rot_mat_alphapar    = self.rotation_matrices_axis_angle(q_axis, half_alpha_par)
+        rot_mat_alphapar_T  = rot_mat_alphapar.transpose(-2, -1)
+        rot_mat_alphaperp   = self.rotation_matrices_axis_angle(perp_axis, half_alpha_perp)
+        rot_mat_alphaperp_T = rot_mat_alphaperp.transpose(-2, -1)
 
-        # Rotation angles (scale by alignment magnitude)
-        # Rotate about q-axis with alpha_perp, and about perp-axis with alpha_par.
-        theta_perp_i = -half_alpha_perp * align_perp_i
-        theta_perp_j = +half_alpha_perp * align_perp_j
-        theta_par_i = -half_alpha_par * align_q
-        theta_par_j = +half_alpha_par * align_q
-
-        # Compose a single rotation operator per interaction side and apply to both p and q.
-        # Order: first rotate about q-axis (alpha_perp), then about perp-axis (alpha_par).
-        q_perp_i = self.quat_from_axis_angle(q_axis, theta_perp_i)
-        q_perp_j = self.quat_from_axis_angle(q_axis, theta_perp_j)
-        q_par_i = self.quat_from_axis_angle(perp_axis_i, theta_par_i)
-        q_par_j = self.quat_from_axis_angle(perp_axis_j, theta_par_j)
-
-        q_tot_i = self.quat_mul(q_par_i, q_perp_i)
-        q_tot_j = self.quat_mul(q_par_j, q_perp_j)
-
-        pi_tilde = self.quat_rotate(q_tot_i, pi)
-        qi_tilde = self.quat_rotate(q_tot_i, qi)
-        pj_tilde = self.quat_rotate(q_tot_j, pj)
-        qj_tilde = self.quat_rotate(q_tot_j, qj)
+        #Applying the rotations, parallel first then perpendicular.
+        pi_tilde = torch.einsum('...ij,...jk,...k->...i', rot_mat_alphapar, rot_mat_alphaperp, pi)
+        pj_tilde = torch.einsum('...ij,...jk,...k->...i', rot_mat_alphaperp_T, rot_mat_alphapar_T, pj)        
+        qi_tilde = torch.einsum('...ij,...jk,...k->...i', rot_mat_alphapar, rot_mat_alphaperp, qi)
+        qj_tilde = torch.einsum('...ij,...jk,...k->...i', rot_mat_alphaperp_T, rot_mat_alphapar_T, qj)
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
@@ -643,6 +585,28 @@ class Simulation:
 
         Vij = z_mask.float() * S * (torch.exp(-d_tilde) - torch.exp(-d_tilde/5))        # Calculating the potential energy between particles masking out false interactions via voronoi_mask
         
+        if self.screen_out_defects:
+            # When  we have pcp defects we only want the cells to interact via the S0 and S1 term
+            # We want to sum up the lambda contributions l2 and l3 and add them to l1 to keep the overall strength the same.
+            assert not(self.nematic_pcp), "Defect screening only implemented for vectorial PCP"
+
+            with torch.no_grad():
+                defect_mask = (torch.sum(qi * qj, dim=2) < 0.7)
+
+            if torch.any(defect_mask):
+                # Calculate S1 for defects using non-rotated vectors
+                S1_def = torch.sum(torch.cross(pj, dx, dim=2) * torch.cross(pi, dx, dim=2), dim=2)
+                S1_def = self.rescale_s(S1_def)
+
+                # Calculate the new S term for defects
+                S_def = l[:,:,0] + (l[:,:,1] + l[:,:,2] + l[:,:,3]) * S1_def
+
+                # Calculate the potential for defects using non-elongated distance 'd'
+                Vij_def = z_mask.float() * S_def * (torch.exp(-d) - torch.exp(-d/5))
+
+                # Update the Vij tensor only for the defect interactions
+                Vij[defect_mask] = Vij_def[defect_mask]      # Recalculating the potential energy for the defect interactions masking out false interactions via voronoi_mask
+
         if torch.unique(p_mask).shape[0] > 1:        # If we have multiple cell types we need to add the repulsion for the purely repulsive interactions
             for repulsion_mask in repulsion_mask_lst:
                 # find the masked interactions for which dists < eq_dist
@@ -818,10 +782,14 @@ class Simulation:
         with torch.no_grad():
             xi_x = torch.empty_like(x).normal_()
             # Rotational noise for p/q: random axis + small angle (eta is angular std dev in radians)
-            axis_p = self.safe_normalize(torch.empty_like(p).normal_(), dim=1)
-            axis_q = self.safe_normalize(torch.empty_like(q).normal_(), dim=1)
-            xi_theta_p = torch.empty((p.shape[0],), device=self.device, dtype=self.dtype).normal_()
-            xi_theta_q = torch.empty((q.shape[0],), device=self.device, dtype=self.dtype).normal_()
+            # we make axis_p and axis_q perpendicular to p and q respectively by taking a random vector and projecting out the parallel component, then normalizing. This ensures the noise is purely rotational and does not change the magnitude of p and q. 
+            
+            xi_p = torch.empty_like(p).normal_()
+            xi_p = xi_p - torch.sum(xi_p * p, dim=1, keepdim=True) * p
+
+            xi_q = torch.empty_like(q).normal_()
+            xi_q = xi_q - torch.sum(xi_q * q, dim=1, keepdim=True) * q
+
             xi_alpha_par = torch.empty_like(alpha_par).normal_()
             xi_alpha_perp = torch.empty_like(alpha_perp).normal_()
 
@@ -839,19 +807,14 @@ class Simulation:
                 mask = p_mask == i
 
                 x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p_tilde[mask] += (-g1_p[mask] * self.dt)
-                q_tilde[mask] += (-g1_q[mask] * self.dt)
-
-                theta_p = (eta * xi_theta_p[mask] * self.sqrt_dt)
-                theta_q = (eta * xi_theta_q[mask] * self.sqrt_dt)
-                p_tilde[mask] = self.rotate_vectors_axis_angle(p_tilde[mask], axis_p[mask], theta_p)
-                q_tilde[mask] = self.rotate_vectors_axis_angle(q_tilde[mask], axis_q[mask], theta_q)
+                p_tilde[mask] += (-g1_p[mask] * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the predictor, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
+                q_tilde[mask] += (-g1_q[mask] * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
 
                 if self.alpha_par_bool_lst[i]:
-                    alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
+                    alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt)    #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
 
                 if self.alpha_perp_bool_lst[i]:
-                    alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
+                    alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt)  #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
 
                 if self.gamma_bool_lst[i]:
                     gamma_tilde[mask] += self.gamma_update_speed * (-g1_gamma[mask] * self.dt)
@@ -892,22 +855,17 @@ class Simulation:
                 mask = p_mask == i
 
                 x[mask] += (-0.5 * (g1_x[mask] + g2_x[mask]) * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p[mask] += (-0.5 * (g1_p[mask] + g2_p[mask]) * self.dt)
-                q[mask] += (-0.5 * (g1_q[mask] + g2_q[mask]) * self.dt)
-
-                theta_p = (eta * xi_theta_p[mask] * self.sqrt_dt)
-                theta_q = (eta * xi_theta_q[mask] * self.sqrt_dt)
-                p[mask] = self.rotate_vectors_axis_angle(p[mask], axis_p[mask], theta_p)
-                q[mask] = self.rotate_vectors_axis_angle(q[mask], axis_q[mask], theta_q)
+                p[mask] += (-0.5 * (g1_p[mask] + g2_p[mask]) * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the corrector, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
+                q[mask] += (-0.5 * (g1_q[mask] + g2_q[mask]) * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
 
                 if self.alpha_par_bool_lst[i]:
-                    alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
+                    alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
 
                 if self.alpha_perp_bool_lst[i]:
-                    alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
+                    alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
 
                 if self.gamma_bool_lst[i]:
-                    gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt)
+                    gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt) #+ (eta * xi_gamma[mask] * self.sqrt_dt)
 
             # Final constraints
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
@@ -1064,84 +1022,6 @@ class Simulation:
 
         return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
 
-    # def cell_apoptosis(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
-    #     """
-    #     Handles cell apoptosis events.
-
-    #     Parameters:
-    #         x (torch.Tensor): The cell positions.
-    #         p (torch.Tensor): The apicobasal polarities.
-    #         q (torch.Tensor): The planar cell polarities.
-    #         p_mask (torch.Tensor or None): The particle mask.
-    #         alpha_par (torch.Tensor): The parallel alpha parameter.
-    #         alpha_perp (torch.Tensor): The perpendicular alpha parameter.
-    #         gamma (torch.Tensor): The gamma (elongation) parameter.
-
-    #     Returns:
-    #         Tuple[bool, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor or None, torch.Tensor]: A tuple containing:
-    #             - apoptosis (bool): Whether apoptosis occurred.
-    #             - x (torch.Tensor): Cell positions with new cells
-    #             - p (torch.Tensor): Apicobasal polarities with new cells
-    #             - q (torch.Tensor): Planar cell polarities with new cells
-    #             - p_mask (torch.Tensor or None): The updated particle mask.
-    #             - beta (torch.Tensor): The apoptosis probabilities.
-    #             - alpha_par (torch.Tensor): The parallel alpha parameter with new cells.
-    #             - alpha_perp (torch.Tensor): The perpendicular alpha parameter with new cells.
-    #             - gamma (torch.Tensor): The gamma (elongation) parameter with new cells.
-    #     """
-
-    #     beta = self.beta            
-
-    #     if torch.sum(beta) < 1e-8:              # If division probabilities are negligible no division occurs
-    #         return False, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma
-
-    #     # set probability according to beta and dt
-    #     d_prob = beta
-    #     # flip coins
-    #     draw = torch.empty_like(beta).uniform_()
-    #     # find successes
-    #     events = draw < d_prob
-    #     division = False
-
-    #     if torch.sum(events) > 0:
-    #         with torch.no_grad():
-    #             division = True
-    #             # find cells that will divide
-    #             idx = torch.nonzero(events)[:, 0]
-
-    #             x0      = x[idx, :]
-    #             p0      = p[idx, :]
-    #             q0      = q[idx, :]
-    #             p_mask0 = p_mask[idx]
-    #             b0      = beta[idx]
-    #             alpha_par0 = alpha_par[idx]
-    #             alpha_perp0 = alpha_perp[idx]
-    #             gamma0 = gamma[idx]
-
-    #             # make a random vector
-    #             move = torch.empty_like(x0).normal_()
-
-    #             # place new cells
-    #             x0 = x0 + move
-
-    #             # append new cell data to the system state
-    #             x = torch.cat((x, x0))
-    #             p = torch.cat((p, p0))
-    #             q = torch.cat((q, q0))
-    #             p_mask = torch.cat((p_mask, p_mask0))
-    #             beta = torch.cat((beta, b0))
-    #             alpha_par = torch.cat((alpha_par, alpha_par0))
-    #             alpha_perp = torch.cat((alpha_perp, alpha_perp0))
-    #             gamma = torch.cat((gamma, gamma0))
-
-    #     x.requires_grad = True
-    #     p.requires_grad = True
-    #     q.requires_grad = True
-    #     alpha_par.requires_grad = True
-    #     alpha_perp.requires_grad = True
-    #     gamma.requires_grad = True
-
-    #     return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
     
 
 def save(data_tuple, name, output_folder):

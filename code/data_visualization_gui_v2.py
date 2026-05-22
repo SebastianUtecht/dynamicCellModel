@@ -392,6 +392,9 @@ class VisPy3DWidget(QWidget):
     # Per-frame state: updated before render() returns
     _cell_scatters: dict
     _polarity_markers: object
+    _vector_visuals: dict
+    _range_plane_visuals: list
+    _range_plane_token: int
     _highlights: dict
 
     def __init__(self, gui: "DataVizGUI"):
@@ -399,6 +402,9 @@ class VisPy3DWidget(QWidget):
         self.gui = gui
         self._cell_scatters = {}
         self._polarity_markers = None
+        self._vector_visuals = {}
+        self._range_plane_visuals = []
+        self._range_plane_token = 0
         self._highlights = {}
         self._camera_bounds_set = False
         self._ghost_visual = None
@@ -468,7 +474,7 @@ class VisPy3DWidget(QWidget):
         # Mouse events
         @self.canvas.events.mouse_press.connect
         def _on_mouse_press(event):
-            if event.button == 2 and self.gui.neighbor_search_enabled:
+            if event.button == 2 and (self.gui.neighbor_search_enabled or getattr(self.gui, "cell_pick_enabled", False)):
                 self._on_right_click()
                 event.handled = True
 
@@ -479,7 +485,7 @@ class VisPy3DWidget(QWidget):
                 shift = "shift" in str(event.modifiers).lower()
             if not shift and hasattr(event, "native") and hasattr(event.native, "modifiers"):
                 shift = bool(event.native.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-            if shift and self.gui.neighbor_search_enabled:
+            if shift and (self.gui.neighbor_search_enabled or getattr(self.gui, "cell_pick_enabled", False)):
                 delta = event.delta[1] if hasattr(event, "delta") and len(event.delta) > 1 else 0
                 self._ghost_sphere_dist = np.clip(
                     self._ghost_sphere_dist + delta, 3.0, 50.0
@@ -499,7 +505,7 @@ class VisPy3DWidget(QWidget):
     # Ghost sphere
     # ------------------------------------------------------------------
     def _update_ghost_sphere(self, _event=None):
-        if self.gui.neighbor_search_enabled:
+        if self.gui.neighbor_search_enabled or getattr(self.gui, "cell_pick_enabled", False):
             self._ghost_pos = self._camera_forward_pos(self._ghost_sphere_dist)
             self._ghost_visual.set_data(
                 np.array([self._ghost_pos]),
@@ -612,6 +618,101 @@ class VisPy3DWidget(QWidget):
             except Exception as e:
                 print(f"[clear polarity] {e}")
             self._polarity_markers = None
+
+        for v in self._vector_visuals.values():
+            try:
+                v.parent = None
+            except Exception as e:
+                print(f"[clear vectors] {e}")
+        self._vector_visuals.clear()
+
+        for v in self._range_plane_visuals:
+            try:
+                v.parent = None
+            except Exception as e:
+                print(f"[clear range planes] {e}")
+        self._range_plane_visuals.clear()
+
+    def show_range_planes(self, axis: int, lo: float, hi: float,
+                          duration_s: float = 3.0, alpha: float = 0.5):
+        """Show two translucent planes at `lo` and `hi` along `axis` for a short time."""
+        g = self.gui
+        if g.data is None:
+            return
+        t = g.current_timestep
+        if "x" not in g.data or t >= len(g.data["x"]):
+            return
+        x = g.data["x"][t]
+        if x is None or len(x) == 0:
+            return
+
+        try:
+            lo_f = float(lo)
+            hi_f = float(hi)
+        except Exception:
+            return
+        if hi_f < lo_f:
+            lo_f, hi_f = hi_f, lo_f
+
+        # Remove any existing range indicators
+        for v in self._range_plane_visuals:
+            try:
+                v.parent = None
+            except Exception:
+                pass
+        self._range_plane_visuals.clear()
+
+        bounds = np.array([np.min(x, axis=0), np.max(x, axis=0)], dtype=np.float32)
+        extent = bounds[1] - bounds[0]
+        pad = np.where(extent > 0, extent * 0.05, 1.0)
+        lo_b = bounds[0] - pad
+        hi_b = bounds[1] + pad
+
+        # Build a quad spanning the other two axes
+        axes_other = [0, 1, 2]
+        if axis not in axes_other:
+            return
+        axes_other.remove(axis)
+        a1, a2 = axes_other
+
+        faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        color = (1.0, 1.0, 1.0, float(alpha))
+
+        def _make_plane(pos_value: float):
+            v = np.zeros((4, 3), dtype=np.float32)
+            v[:, axis] = float(pos_value)
+            v[0, a1], v[0, a2] = lo_b[a1], lo_b[a2]
+            v[1, a1], v[1, a2] = hi_b[a1], lo_b[a2]
+            v[2, a1], v[2, a2] = hi_b[a1], hi_b[a2]
+            v[3, a1], v[3, a2] = lo_b[a1], hi_b[a2]
+
+            m = visuals.Mesh(vertices=v, faces=faces, color=color, shading=None)
+            try:
+                m.set_gl_state('translucent', depth_test=True)
+            except Exception:
+                pass
+            self.view.add(m)
+            self._range_plane_visuals.append(m)
+
+        _make_plane(lo_f)
+        _make_plane(hi_f)
+        self.canvas.update()
+
+        self._range_plane_token += 1
+        token = self._range_plane_token
+
+        def _hide_if_still_current():
+            if token != self._range_plane_token:
+                return
+            for v in self._range_plane_visuals:
+                try:
+                    v.parent = None
+                except Exception:
+                    pass
+            self._range_plane_visuals.clear()
+            self.canvas.update()
+
+        QTimer.singleShot(int(duration_s * 1000), _hide_if_still_current)
 
     def clear_highlights(self):
         for v in self._highlights.values():
@@ -1027,9 +1128,10 @@ class VisPy3DWidget(QWidget):
         # Choose color mode
         mode = g.color_mode  # "type" | "depth" | "scalar"
 
-        # Check if we should show cell markers (skip if Voronoi enabled and toggle is off)
-        show_cell_markers = True
-        if self.voronoi_enabled:
+        # Check if we should show cell markers (skip if Voronoi enabled and toggle is off,
+        # or if vector-only mode is enabled)
+        show_cell_markers = not bool(getattr(g, "vector_mode", False))
+        if show_cell_markers and self.voronoi_enabled:
             # Only check toggle if Voronoi UI was created (VORONOI_AVAILABLE)
             if hasattr(self, 'voronoi_show_cells_check'):
                 show_cell_markers = self.voronoi_show_cells_check.isChecked()
@@ -1064,7 +1166,13 @@ class VisPy3DWidget(QWidget):
                     self._add_scatter("default", x_f, "green")
 
         # Polarity vectors
-        if g.show_polarity:
+        if bool(getattr(g, "vector_mode", False)):
+            p_all = g.data["p"][t] if ("p" in g.data and t < len(g.data["p"])) else None
+            q_all = g.data["q"][t] if ("q" in g.data and t < len(g.data["q"])) else None
+            if (p_all is not None and q_all is not None and
+                len(p_all) == len(x) and len(q_all) == len(x)):
+                self._render_dual_polarity_vectors(x_f, p_all[bool_mask], q_all[bool_mask])
+        elif g.show_polarity:
             pkey = "p" if g.polarity_type == "p" else "q"
             pol_all = g.data.get(pkey, [None])[t]
             if pol_all is not None and len(pol_all) > 0:
@@ -1165,12 +1273,65 @@ class VisPy3DWidget(QWidget):
         self.view.add(m)
         self._polarity_markers = m
 
+    def _render_dual_polarity_vectors(self, x_f: np.ndarray,
+                                     p_f: np.ndarray,
+                                     q_f: np.ndarray):
+        """Render ABP (p) and PCP (q) as two sets of vectors from each point."""
+        if x_f is None or len(x_f) == 0:
+            return
+
+        def _segments(origins: np.ndarray, vecs: np.ndarray, length: float) -> np.ndarray:
+            vecs = np.asarray(vecs, dtype=np.float32)
+            origins = np.asarray(origins, dtype=np.float32)
+            norms = np.linalg.norm(vecs, axis=1)
+            valid = norms > 0
+            if not valid.any():
+                return np.empty((0, 3), dtype=np.float32)
+
+            vhat = vecs[valid] / norms[valid, np.newaxis]
+            a = origins[valid]
+            b = a + length * vhat
+
+            seg = np.empty((a.shape[0] * 2, 3), dtype=np.float32)
+            seg[0::2] = a
+            seg[1::2] = b
+            return seg
+
+        # Scale vectors relative to cell size for visual consistency.
+        length = float(getattr(self.gui, "cell_size", 2.0)) * 0.9
+
+        p_segs = _segments(x_f, p_f, length)
+        q_segs = _segments(x_f, q_f, length)
+
+        if len(p_segs) > 0:
+            ln_p = visuals.Line(
+                pos=p_segs,
+                connect="segments",
+                color=(1.0, 0.0, 0.0, 1.0),
+                width=10,
+            )
+            self.view.add(ln_p)
+            self._vector_visuals["abp"] = ln_p
+
+        if len(q_segs) > 0:
+            ln_q = visuals.Line(
+                pos=q_segs,
+                connect="segments",
+                color=(0.0, 0.0, 1.0, 1.0),
+                width=10,
+            )
+            self.view.add(ln_q)
+            self._vector_visuals["pcp"] = ln_q
+
     # ------------------------------------------------------------------
     # Neighbour highlighting
     # ------------------------------------------------------------------
     def highlight_cells(self, sel_idx: int, nbr_indices):
         self.clear_highlights()
         g = self.gui
+        if bool(getattr(g, "vector_mode", False)):
+            self.canvas.update()
+            return
         x = g.data["x"][g.current_timestep]
         # Selected cell — white, slightly larger
         s1 = visuals.Markers(scaling=True, alpha=1.0, spherical=True)
@@ -1197,7 +1358,10 @@ class VisPy3DWidget(QWidget):
         dists = np.linalg.norm(x - self._ghost_pos, axis=1)
         idx = int(np.argmin(dists))
         if dists[idx] <= self._ghost_sphere_radius:
-            g.on_cell_selected(idx)
+            if hasattr(g, "on_cell_picked"):
+                g.on_cell_picked(idx)
+            else:
+                g.on_cell_selected(idx)
 
     # ------------------------------------------------------------------
     # Image / video export
@@ -1227,6 +1391,7 @@ class DataVizGUI(QMainWindow):
     cell_size: float
     show_polarity: bool
     polarity_type: str          # "p" or "q"
+    vector_mode: bool
     bisection_enabled: bool
     bisection_plane: str
     bisection_position: float
@@ -1236,6 +1401,7 @@ class DataVizGUI(QMainWindow):
     visible_types: set
     cell_type_colors: dict
     neighbor_search_enabled: bool
+    cell_pick_enabled: bool
     scalar_keys: list           # dynamically detected scalar keys
 
     def __init__(self):
@@ -1266,6 +1432,7 @@ class DataVizGUI(QMainWindow):
         self.cell_size = 2.0
         self.show_polarity = False
         self.polarity_type = "p"
+        self.vector_mode = False
 
         self.bisection_enabled = False
         self.bisection_plane = "XY"
@@ -1279,6 +1446,9 @@ class DataVizGUI(QMainWindow):
 
         self.neighbor_search_enabled = False
         self.neighbor_data = {}
+
+        # Generic picking (right-click through ghost sphere)
+        self.cell_pick_enabled = False
 
         # Voronoi visualization state
         self.voronoi_enabled = False
@@ -1349,6 +1519,7 @@ class DataVizGUI(QMainWindow):
         self._build_playback_tab()
         self._build_viz_tab()
         self._build_section_tab()
+        self._build_curate_tab()
         self._build_tools_tab()
 
         splitter.addWidget(self.tabs)
@@ -1513,8 +1684,12 @@ class DataVizGUI(QMainWindow):
         self.pol_combo = QComboBox()
         self.pol_combo.addItems(["Apicobasal (p)", "Planar (q)"])
         self.pol_combo.currentTextChanged.connect(self._on_polarity_type_changed)
+        self.vector_mode_check = QCheckBox("Vector mode (p+q)")
+        self.vector_mode_check.setToolTip("Hide cell spheres and render ABP (p, red) + PCP (q, blue) vectors")
+        self.vector_mode_check.stateChanged.connect(self._on_vector_mode_changed)
         pol_layout.addWidget(self.pol_checkbox)
         pol_layout.addWidget(self.pol_combo)
+        pol_layout.addWidget(self.vector_mode_check)
         layout.addWidget(pol_group)
 
         # Display
@@ -1746,6 +1921,316 @@ class DataVizGUI(QMainWindow):
         self.tabs.addTab(scroll, "Tools")
 
     # ------------------------------------------------------------------
+    # Tab 5: Data Curating (edit p_mask + export single frame)
+    # ------------------------------------------------------------------
+    def _build_curate_tab(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        pick_group = QGroupBox("Picking")
+        pick_layout = QVBoxLayout(pick_group)
+        self.cur_pick_check = QCheckBox("Enable click-pick (right-click)")
+        self.cur_pick_check.setToolTip(
+            "Shows a cyan ghost sphere in front of the camera.\n"
+            "Right-click to pick the closest cell inside it.\n"
+            "Hold Shift + mouse wheel to move the sphere in/out."
+        )
+        self.cur_pick_check.stateChanged.connect(self._on_cur_pick_toggled)
+        pick_layout.addWidget(self.cur_pick_check)
+
+        self.cur_selected_info = QTextBrowser()
+        self.cur_selected_info.setMaximumHeight(90)
+        self.cur_selected_info.setPlainText("Selected cell: (none)")
+        pick_layout.addWidget(self.cur_selected_info)
+
+        layout.addWidget(pick_group)
+
+        wipe_group = QGroupBox("Wipe / Reset p_mask (current timestep)")
+        wipe_layout = QHBoxLayout(wipe_group)
+        wipe_layout.addWidget(QLabel("Set all p_mask to:"))
+        self.cur_wipe_value = QSpinBox()
+        self.cur_wipe_value.setRange(-10_000_000, 10_000_000)
+        self.cur_wipe_value.setValue(0)
+        wipe_layout.addWidget(self.cur_wipe_value)
+        self.cur_wipe_btn = QPushButton("Wipe")
+        self.cur_wipe_btn.clicked.connect(self._cur_wipe_pmask)
+        wipe_layout.addWidget(self.cur_wipe_btn)
+        layout.addWidget(wipe_group)
+
+        range_group = QGroupBox("Assign by coordinate range (current timestep)")
+        range_layout = QFormLayout(range_group)
+
+        self.cur_axis_combo = QComboBox()
+        self.cur_axis_combo.addItems(["X", "Y", "Z"])
+        range_layout.addRow("Axis:", self.cur_axis_combo)
+
+        mm_row = QHBoxLayout()
+        self.cur_min_spin = QDoubleSpinBox()
+        self.cur_min_spin.setDecimals(4)
+        self.cur_min_spin.setRange(-1e9, 1e9)
+        self.cur_min_spin.setValue(-1.0)
+        self.cur_max_spin = QDoubleSpinBox()
+        self.cur_max_spin.setDecimals(4)
+        self.cur_max_spin.setRange(-1e9, 1e9)
+        self.cur_max_spin.setValue(1.0)
+        mm_row.addWidget(QLabel("Min"))
+        mm_row.addWidget(self.cur_min_spin)
+        mm_row.addSpacing(8)
+        mm_row.addWidget(QLabel("Max"))
+        mm_row.addWidget(self.cur_max_spin)
+        mm_row.addStretch()
+        mm_wrap = QWidget()
+        mm_wrap.setLayout(mm_row)
+        range_layout.addRow("Range:", mm_wrap)
+
+        self.cur_range_type = QSpinBox()
+        self.cur_range_type.setRange(-10_000_000, 10_000_000)
+        self.cur_range_type.setValue(1)
+        range_layout.addRow("Set p_mask to:", self.cur_range_type)
+
+        self.cur_apply_range_btn = QPushButton("Apply Range")
+        self.cur_apply_range_btn.clicked.connect(self._cur_apply_range)
+        range_layout.addRow(self.cur_apply_range_btn)
+        layout.addWidget(range_group)
+
+        sel_group = QGroupBox("Assign selected cell (current timestep)")
+        sel_layout = QHBoxLayout(sel_group)
+        sel_layout.addWidget(QLabel("Set selected p_mask to:"))
+        self.cur_sel_type = QSpinBox()
+        self.cur_sel_type.setRange(-10_000_000, 10_000_000)
+        self.cur_sel_type.setValue(1)
+        sel_layout.addWidget(self.cur_sel_type)
+        self.cur_apply_sel_btn = QPushButton("Apply to Selected")
+        self.cur_apply_sel_btn.clicked.connect(self._cur_apply_selected)
+        sel_layout.addWidget(self.cur_apply_sel_btn)
+        self.cur_clear_sel_btn = QPushButton("Clear Selection")
+        self.cur_clear_sel_btn.clicked.connect(self._cur_clear_selection)
+        sel_layout.addWidget(self.cur_clear_sel_btn)
+        layout.addWidget(sel_group)
+
+        exp_group = QGroupBox("Export")
+        exp_layout = QVBoxLayout(exp_group)
+        self.cur_export_btn = QPushButton("Export Curated Frame (pkl)")
+        self.cur_export_btn.setObjectName("success")
+        self.cur_export_btn.clicked.connect(self._cur_export_frame)
+        exp_layout.addWidget(self.cur_export_btn)
+        layout.addWidget(exp_group)
+
+        layout.addStretch()
+        scroll.setWidget(inner)
+        self.tabs.addTab(scroll, "Data Curating")
+
+    def _on_cur_pick_toggled(self, state: int):
+        self.cell_pick_enabled = bool(state)
+
+    def on_cell_picked(self, cell_idx: int):
+        """Handle a right-click pick from the VisPy canvas."""
+        if self.data is None:
+            return
+        try:
+            self.selected_cell_idx = int(cell_idx)
+        except Exception:
+            return
+
+        # Highlight at least the selected cell
+        try:
+            self.canvas_widget.highlight_cells(self.selected_cell_idx, [])
+        except Exception:
+            pass
+
+        # If neighbour data is available, keep the existing neighbour-selection behaviour
+        if self.current_timestep in self.neighbor_data:
+            self.on_cell_selected(self.selected_cell_idx)
+
+        self._update_curate_selected_info()
+
+    def _update_curate_selected_info(self):
+        if not hasattr(self, "cur_selected_info"):
+            return
+        if self.data is None:
+            self.cur_selected_info.setPlainText("Selected cell: (none)")
+            return
+
+        t = self.current_timestep
+        idx = self.selected_cell_idx
+        if idx is None:
+            self.cur_selected_info.setPlainText("Selected cell: (none)")
+            return
+
+        x = self.data.get("x", [None])[t]
+        pm = self.data.get("p_mask", [None])[t] if "p_mask" in self.data and t < len(self.data["p_mask"]) else None
+        if x is None or idx < 0 or idx >= len(x):
+            self.cur_selected_info.setPlainText("Selected cell: (none)")
+            return
+
+        pos = x[idx]
+        typ = int(pm[idx]) if pm is not None and len(pm) == len(x) else None
+        msg = f"Selected cell: {idx}\n"
+        msg += f"Position: [{pos[0]:.4g}, {pos[1]:.4g}, {pos[2]:.4g}]\n"
+        msg += f"Current p_mask: {typ}" if typ is not None else "Current p_mask: (missing)"
+        self.cur_selected_info.setPlainText(msg)
+
+    def _ensure_pmask_for_current_timestep(self) -> np.ndarray | None:
+        if self.data is None or "x" not in self.data:
+            return None
+        t = self.current_timestep
+        x = self.data["x"][t]
+        if x is None:
+            return None
+
+        if "p_mask" not in self.data:
+            self.data["p_mask"] = [None] * len(self.data["x"])
+
+        pm = self.data["p_mask"][t] if t < len(self.data["p_mask"]) else None
+        if pm is None or len(pm) != len(x):
+            pm = np.zeros(len(x), dtype=np.int32)
+        else:
+            pm = np.asarray(pm, dtype=np.int32).copy()
+
+        self.data["p_mask"][t] = pm
+        return pm
+
+    def _after_pmask_edit(self):
+        """Refresh derived type state + UI + render after p_mask edits."""
+        if self.data is None:
+            return
+        t = self.current_timestep
+        pm = self.data.get("p_mask", [None])[t]
+        if pm is None:
+            return
+
+        try:
+            unique = sorted(set(int(v) for v in np.unique(pm)))
+        except Exception:
+            unique = []
+        self.unique_types = unique
+        self.visible_types = set(unique)
+        self._generate_type_colors()
+        if hasattr(self, "type_list"):
+            self._populate_type_list()
+
+        self._update_curate_selected_info()
+        self._refresh()
+
+    def _cur_wipe_pmask(self):
+        if self.data is None:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+        pm = self._ensure_pmask_for_current_timestep()
+        if pm is None:
+            QMessageBox.warning(self, "Missing Data", "No x/p_mask available for this timestep.")
+            return
+
+        val = int(self.cur_wipe_value.value())
+        pm[:] = val
+        self.data["p_mask"][self.current_timestep] = pm
+        self._after_pmask_edit()
+
+    def _cur_apply_range(self):
+        if self.data is None:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+        t = self.current_timestep
+        x = self.data.get("x", [None])[t]
+        if x is None:
+            QMessageBox.warning(self, "Missing Data", "No x available for this timestep.")
+            return
+
+        pm = self._ensure_pmask_for_current_timestep()
+        if pm is None:
+            QMessageBox.warning(self, "Missing Data", "No p_mask available for this timestep.")
+            return
+
+        axis = {"X": 0, "Y": 1, "Z": 2}[self.cur_axis_combo.currentText()]
+        lo = float(self.cur_min_spin.value())
+        hi = float(self.cur_max_spin.value())
+        if hi < lo:
+            lo, hi = hi, lo
+
+        mask = (x[:, axis] >= lo) & (x[:, axis] <= hi)
+        pm[mask] = int(self.cur_range_type.value())
+        self.data["p_mask"][t] = pm
+        try:
+            self.canvas_widget.show_range_planes(axis, lo, hi, duration_s=3.0, alpha=0.5)
+        except Exception:
+            pass
+        self._after_pmask_edit()
+
+    def _cur_apply_selected(self):
+        if self.data is None:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+        if self.selected_cell_idx is None:
+            QMessageBox.warning(self, "No Selection", "Pick a cell first (enable picking + right-click).")
+            return
+
+        t = self.current_timestep
+        x = self.data.get("x", [None])[t]
+        if x is None:
+            QMessageBox.warning(self, "Missing Data", "No x available for this timestep.")
+            return
+
+        pm = self._ensure_pmask_for_current_timestep()
+        if pm is None:
+            QMessageBox.warning(self, "Missing Data", "No p_mask available for this timestep.")
+            return
+
+        idx = int(self.selected_cell_idx)
+        if idx < 0 or idx >= len(pm):
+            QMessageBox.warning(self, "Out of Range", "Selected cell index out of range.")
+            return
+        pm[idx] = int(self.cur_sel_type.value())
+        self.data["p_mask"][t] = pm
+        self._after_pmask_edit()
+
+    def _cur_clear_selection(self):
+        self.selected_cell_idx = None
+        try:
+            self.canvas_widget.clear_highlights()
+        except Exception:
+            pass
+        self._update_curate_selected_info()
+
+    def _cur_export_frame(self):
+        if self.data is None:
+            QMessageBox.warning(self, "No Data", "Load data first.")
+            return
+        t = self.current_timestep
+
+        missing = []
+        for k in ("x", "p_mask", "p", "q"):
+            if k not in self.data or t >= len(self.data[k]) or self.data[k][t] is None:
+                missing.append(k)
+        if missing:
+            QMessageBox.warning(self, "Missing Data", f"Cannot export; missing at timestep {t}: {', '.join(missing)}")
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Curated Frame",
+            f"curated_frame_t{t}.pkl",
+            "Pickle files (*.pkl)",
+        )
+        if not filename:
+            return
+
+        frame = {
+            "x": np.asarray(self.data["x"][t]).copy(),
+            "p_mask": np.asarray(self.data["p_mask"][t], dtype=np.int32).copy(),
+            "p": np.asarray(self.data["p"][t]).copy(),
+            "q": np.asarray(self.data["q"][t]).copy(),
+        }
+        try:
+            with open(filename, "wb") as f:
+                pickle.dump(frame, f, protocol=pickle.HIGHEST_PROTOCOL)
+            QMessageBox.information(self, "Exported", f"Saved curated frame:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export:\n{e}")
+
+    # ------------------------------------------------------------------
     # Slider / spinbox sync helper
     # ------------------------------------------------------------------
     def _sync_slider_spinbox(self, slider, spinbox, value, attr: str):
@@ -1820,7 +2305,16 @@ class DataVizGUI(QMainWindow):
         for key in self.scalar_keys:
             if key in raw and raw[key]:
                 try:
-                    all_vals = np.concatenate([v for v in raw[key] if v is not None]).astype(np.float32)
+                    vals_list = [v for v in raw[key] if v is not None]
+
+                    # Special-case: the last `energy` frame is a dummy of all zeros.
+                    # Exclude it from global range so it doesn't crush contrast.
+                    if key == "energy" and len(vals_list) > 1:
+                        last = np.asarray(vals_list[-1], dtype=np.float32)
+                        if last.size > 0 and np.all(np.isfinite(last)) and np.allclose(last, 0.0):
+                            vals_list = vals_list[:-1]
+
+                    all_vals = np.concatenate(vals_list).astype(np.float32)
                     if self._is_logspace_scalar(key):
                         pos = all_vals[all_vals > 0]
                         if len(pos) == 0:
@@ -1929,11 +2423,28 @@ class DataVizGUI(QMainWindow):
         self.scalar_combo.blockSignals(False)
 
     def _generate_type_colors(self):
-        cmap = plt.get_cmap("Set1")
+        # Persistent, deterministic colors by p_mask value.
+        # Example: 0=red, 1=blue, 2=green, then repeats.
+        cycle = [
+            (1.0, 0.0, 0.0, 1.0),  # red
+            (0.0, 0.0, 1.0, 1.0),  # blue
+            (0.0, 1.0, 0.0, 1.0),  # green
+            (1.0, 1.0, 0.0, 1.0),  # yellow
+            (1.0, 0.0, 1.0, 1.0),  # magenta
+            (0.0, 1.0, 1.0, 1.0),  # cyan
+            (1.0, 0.5, 0.0, 1.0),  # orange
+            (0.6, 0.2, 1.0, 1.0),  # purple
+            (0.7, 0.7, 0.7, 1.0),  # gray
+        ]
+
         self.cell_type_colors = {}
-        for i, ct in enumerate(self.unique_types):
-            rgba = cmap(i % 9)
-            self.cell_type_colors[ct] = rgba
+        n = len(cycle)
+        for ct in self.unique_types:
+            try:
+                idx = int(ct) % n
+            except Exception:
+                idx = 0
+            self.cell_type_colors[ct] = cycle[idx]
 
     def _populate_type_list(self):
         self.type_list.clear()
@@ -2291,13 +2802,35 @@ class DataVizGUI(QMainWindow):
         self.colorbar_group.setVisible(True)
 
     def _on_polarity_changed(self, state: int):
+        if self.vector_mode:
+            self.show_polarity = False
+            return
         self.show_polarity = bool(state)
         self._refresh()
 
     def _on_polarity_type_changed(self, text: str):
         self.polarity_type = "p" if "Apicobasal" in text else "q"
-        if self.show_polarity:
+        if self.show_polarity and (not self.vector_mode):
             self._refresh()
+
+    def _on_vector_mode_changed(self, state: int):
+        self.vector_mode = bool(state)
+        if self.vector_mode:
+            # Supersede the old polarity-tip mode
+            self.show_polarity = False
+            if hasattr(self, "pol_checkbox"):
+                self.pol_checkbox.blockSignals(True)
+                self.pol_checkbox.setChecked(False)
+                self.pol_checkbox.blockSignals(False)
+                self.pol_checkbox.setEnabled(False)
+            if hasattr(self, "pol_combo"):
+                self.pol_combo.setEnabled(False)
+        else:
+            if hasattr(self, "pol_checkbox"):
+                self.pol_checkbox.setEnabled(True)
+            if hasattr(self, "pol_combo"):
+                self.pol_combo.setEnabled(True)
+        self._refresh()
 
     def _on_axes_changed(self, state: int):
         visible = bool(state)
