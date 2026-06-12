@@ -44,7 +44,8 @@ class Simulation:
 
         # Main model parameters
         self.lambdas        = torch.tensor(sim_dict['lambdas'], device=self.device, dtype=self.dtype)   # Lambda values determining cell interactions
-        etas                = sim_dict['etas']              # Noise strength
+        etas                = sim_dict['etas']                                                          # Noise strength
+        
         if isinstance(etas, list):
             self.eta0, self.eta1 = etas
             self.eta_lst = [self.eta0, self.eta1]
@@ -53,6 +54,7 @@ class Simulation:
             self.eta_lst = [self.eta0]
         else:
             raise ValueError("etas should be either a list of two values or a single value")
+        
         self.alpha_params   = sim_dict['alpha_params']      # Determines how cells wedge
         self.gamma_params   = sim_dict['gamma_params']      # Determines how cells elongate
         self.prolif_rate    = sim_dict['prolif_rate']       # Probability of cell proliferation for each cell
@@ -60,24 +62,6 @@ class Simulation:
         self.nematic_pcp    = sim_dict['nematic_pcp']     # Whether planar cell polarity is nematic (True) or vectorial (False)
         self.update_cells_bools = sim_dict['update_cells_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
         self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
-        self.wedge_pcp = sim_dict['wedge_pcp']                     # Whether to apply wedging rotations to the PCP as well as the ABP. Only relevant if alpha parameters are non-zero
-        # Boundary parameters
-        self.bound_type         = sim_dict['bound_type']
-        assert self.bound_type == 'planes' or self.bound_type == 'cylinder' or self.bound_type == None, 'Boundtype expected to be in ["planes", "cylinder", None]'
-        self.bound_extents      = sim_dict['bound_extents']      # Extents for boundary conditions. For planes, this is the x and y extent. For cylinder, this is the radius and height
-        self.bound_move_times   = sim_dict['bound_move_times']   # If using planes, this is the times at which the planes move. For cylinder, this is the time at which the cylinder starts moving
-        self.bound_continuity   = sim_dict['bound_continuity']   # Continuity for boundary conditions
-        self.bound_speed        = (self.bound_extents  [1] - self.bound_extents[0]) / ( (self.bound_move_times[1] - self.bound_move_times[0]) )  if self.bound_move_times is not None else 0.0 # Speed of boundary movement. Only relevant if bound_move_times is not None
-        self.bound_cur_ext      = self.bound_extents[0] if self.bound_move_times is not None else None # Current extent of the boundary. Only relevant if bound_move_times is not None
-
-        # Stretching parameters
-        self.stretch_factor     = sim_dict['stretch_factor']        # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
-        self.stretch_stop_ext   = sim_dict['stretch_stop_ext']      # The extent at which the stretch stops. Only relevant if stretch_factor is not 0
-        self.stretch_time_stop = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
-        self.just_move_bool     = sim_dict['just_move_bool']        # Whether to just move the cells according to the stretching without applying any of the other forces. Useful for debugging the stretching implementation
-
-        # Both stretch and bound
-        self.stretch_bound_axis = sim_dict['stretch_bound_axis'] # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
         
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
@@ -142,14 +126,12 @@ class Simulation:
         torch.manual_seed(self.random_seed)                 # For reproducibility
         self.tstep = 0
     
-    #Checked
     def elong_func_linear(self, q_mean, dx):
         dot = (q_mean * dx).sum(dim=2)
         dot = torch.abs(dot)
         elong =  1 - 4/np.pi * torch.arccos(dot)
         return elong
     
-    #Checked
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
 
@@ -158,46 +140,6 @@ class Simulation:
         n = torch.linalg.norm(v, dim=dim, keepdim=True)
         return v / torch.clamp(n, min=eps)
 
-    def rotation_matrices_axis_angle(self, axis, angle, eps: float = 1e-12):
-        """Create rotation matrices from axis-angle (Rodrigues)
-
-        Parameters:
-            axis: (..., 3) rotation axes
-            angle: (...) rotation angles (radians)
-        Returns:
-            R: (..., 3, 3)
-        """
-
-        axis_norm = torch.linalg.norm(axis, dim=-1)
-        valid = axis_norm > eps
-
-        # Normalised axis; value doesn't matter where invalid because angle will be zeroed.
-        u = axis / torch.clamp(axis_norm, min=eps)[..., None]
-        angle = angle * valid.to(angle.dtype)
-
-        ux, uy, uz = u.unbind(dim=-1)
-        zero = torch.zeros_like(ux)
-
-        K = torch.stack(
-            (
-                torch.stack((zero, -uz, uy), dim=-1),
-                torch.stack((uz, zero, -ux), dim=-1),
-                torch.stack((-uy, ux, zero), dim=-1),
-            ),
-            dim=-2,
-        )
-
-        I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand(axis.shape[:-1] + (3, 3))
-
-        theta = angle[..., None, None]
-        c = torch.cos(theta)
-        s = torch.sin(theta)
-        one_minus_c = 1.0 - c
-
-        uuT = u[..., :, None] * u[..., None, :]
-        R = c * I + one_minus_c * uuT + s * K
-        return R
-    
     @staticmethod
     def find_potential_neighbours(x, k):
 
@@ -374,97 +316,7 @@ class Simulation:
                         raise e
 
         return result_tensor
-
-    def advance_boundary_state(self):
-        """Advance boundary state once per timestep (beginning-of-step)."""
-        if self.bound_type is None or self.bound_move_times is None:
-            return
-        if self.bound_cur_ext is None:
-            return
-        if self.tstep > self.bound_move_times[0] and self.tstep < self.bound_move_times[1]:
-            self.bound_cur_ext += self.bound_speed
-
-    def advance_stretch_state(self, pos, p_mask):
-        """Advance stretch state once per timestep (beginning-of-step).
-
-        This moves any stateful stopping logic out of the potential evaluation so multi-stage
-        integrators do not double-advance it.
-        """
-        if self.stretch_factor == 0.0:
-            return
-        if self.stretch_stop_ext is None:
-            return
-        x_pos = pos[p_mask == 1][:, self.stretch_bound_axis]
-        if x_pos.numel() == 0:
-            return
-        if torch.abs(torch.min(x_pos) - torch.max(x_pos)) > self.stretch_stop_ext:
-            self.stretch_factor = 0.0
-
-    def stretch_energy(self, pos, p_mask):
-        """Pure stretch contribution to the potential energy (no mutation)."""
-        if self.stretch_factor == 0.0:
-            return 0.0
-        x_pos = pos[p_mask == 1][:, self.stretch_bound_axis]
-        if x_pos.numel() == 0:
-            return 0.0
-        v_add = -self.stretch_factor * torch.abs(x_pos - self.x_mass_midpoint)
-        return v_add.sum()
     
-    def bound(self, pos):
-        if self.bound_type is None:
-            return 0.0
-        elif self.tstep > (self.bound_move_times[1] + self.bound_continuity):
-            return 0.0
-        elif self.bound_type == 'planes':
-            return self.planes_bound(pos)
-        elif self.bound_type == 'cylinder':
-            return self.cylinder_bound(pos)
-        else:
-            return 0.0
-        
-    def planes_bound(self, pos):
-        
-        bound_dists = torch.abs(pos[:, self.stretch_bound_axis]) - self.bound_cur_ext/2
-        v_add = torch.where(bound_dists > 0, 2 * bound_dists**2, 0.0)
-        if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff.
-            print("Warning: NaN or Inf detected in potential energy")
-        V_add_sum = v_add.sum()                             
-        return V_add_sum
-    
-    def cylinder_bound(self, pos):
-        # cylinder along self.stretch_bound_axis, so we calculate the distance in the plane perpendicular to that axis
-        if self.stretch_bound_axis == 0:
-            bound_dists = torch.sqrt(torch.sum(pos[:, 1:3]**2, dim=1)) - self.bound_cur_ext/2
-        elif self.stretch_bound_axis == 1:
-            bound_dists = torch.sqrt(torch.sum(pos[:, ::2]**2, dim=1)) - self.bound_cur_ext/2
-        else:
-            bound_dists = torch.sqrt(torch.sum(pos[:, :2]**2, dim=1)) - self.bound_cur_ext/2
-        v_add = torch.where(bound_dists > 0, 2 * bound_dists**2, 0.0)
-        if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff.
-            print("Warning: NaN or Inf detected in potential energy")
-        V_add_sum = v_add.sum()                                                         # Add it all up as we need it in scalar form for gradient computation.
-        return V_add_sum
-
-
-    def sphere_bound(self, pos):
-        """
-        Calculating additions to the potential due to spherical boundary conditions.
-        Only does anything if self.bound_radius is a float.
-
-        Parameters:
-            pos (torch.Tensor): Input tensor of shape (N, 3) where N is the number of points.
-
-        Returns:
-            V_add_sum (float): Addition to the potential energy due to spherical boundary conditions.
-
-        """
-
-        bound_dists = torch.sqrt(torch.sum((pos)**2, dim=1))                            # Calculate distances from the center
-        v_add       = torch.where(bound_dists > self.bound_radius, bound_dists**2, 0.0) # Calculate additional potential energy
-        if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff. 
-            print("Warning: NaN or Inf detected in potential energy")
-        V_add_sum = v_add.sum()                                                         # Add it all up as we need it in scalar form for gradient computation.
-        return V_add_sum
     
     def rescale_s(self, S):
         S_rescaled = (S + 1.0) / 2.0
@@ -530,37 +382,28 @@ class Simulation:
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
         alpha_par_j = alpha_par[idx]
         alpha_par_mean = (alpha_par_i + alpha_par_j) / 2.0
-
+        alpha_par_mean = torch.tan(alpha_par_mean/2)
         alpha_perp_i = alpha_perp[:, None].expand(alpha_perp.shape[0], idx.shape[1])
         alpha_perp_j = alpha_perp[idx]
         alpha_perp_mean = (alpha_perp_i + alpha_perp_j) / 2.0
+        alpha_perp_mean = torch.tan(alpha_perp_mean/2)
 
-        q_axis = q_mean
-        perp_axis = self.safe_normalize(torch.cross(q_mean, p_mean, dim=2), dim=2)
+        # Implementing cell wedging
+        perp_dir = torch.cross(q_mean, pi, dim=2)
+        perp_dir = perp_dir / torch.sqrt(torch.sum(perp_dir**2, dim=2))[:,:,None]
 
-        c_par = torch.sum(q_axis * dx, dim=2)
-        c_perp = torch.sum(perp_axis * dx, dim=2)
+        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                    
+        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                
+        Z = Z_par + Z_perp
 
-        #Implementing cell wedging via rotations (axis-angle)
-        omega_i = 0.5 * (alpha_par_mean[:,:,None] * c_par[:,:,None] * perp_axis - alpha_perp_mean[:,:,None] * c_perp[:,:,None] * q_axis)
-        omega_j = -omega_i
+        pi_tilde = pi - Z
+        pj_tilde = pj + Z
 
-        axis_i = self.safe_normalize(omega_i, dim=2)
-        angle_i = torch.linalg.norm(omega_i, dim=2)
-        rot_mat_i = self.rotation_matrices_axis_angle(axis_i, angle_i)
-
-        axis_j = self.safe_normalize(omega_j, dim=2)
-        angle_j = torch.linalg.norm(omega_j, dim=2)
-        rot_mat_j = self.rotation_matrices_axis_angle(axis_j, angle_j)
-
-        pi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
-        pj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
-        if self.wedge_pcp:
-            qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
-            qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
-        else:
-            qi_tilde = qi
-            qj_tilde = qj
+        # Normalizing the ABPs
+        # wedged_interactions = torch.any((alpha_par_mean > 1e-5) | (alpha_perp_mean > 1e-5), dim=2)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        wedged_interactions = torch.logical_or(alpha_par_mean > 1e-5, alpha_perp_mean > 1e-5)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        pi_tilde[wedged_interactions] = pi_tilde[wedged_interactions] / torch.sqrt(torch.sum(pi_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+        pj_tilde[wedged_interactions] = pj_tilde[wedged_interactions] / torch.sqrt(torch.sum(pj_tilde[wedged_interactions] ** 2, dim=1))[:, None]
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
@@ -570,8 +413,8 @@ class Simulation:
 
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
-        S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
-        S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
+        S2 = torch.sum(torch.cross(pi_tilde, qi, dim=2) * torch.cross(pj_tilde, qj, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
+        S3 = torch.sum(torch.cross(qi, dx, dim=2) * torch.cross(qj, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
 
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
@@ -636,18 +479,7 @@ class Simulation:
             gamma_diff_sum = torch.sum(gamma_diff)
             Vij_sum += gamma_diff_sum * self.gamma_diff_penalty
 
-        if self.tstep > 1_000:
-            # Boundary conditions
-            bc = self.bound(x)
-            if not self.just_move_bool:
-                stretch = self.stretch_energy(x, p_mask)
-            else:
-                stretch = 0.0
-        else:
-            bc = 0.0
-            stretch = 0.0
-
-        V = Vij_sum + bc + stretch
+        V = Vij_sum
 
         num_neighbors = torch.sum(z_mask, dim=1)           
         Vij_normed = Vij / num_neighbors[:, None]       
@@ -760,14 +592,7 @@ class Simulation:
 
         # Start with cell division
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
-        # self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
-        # Advance any stateful boundary/stretch logic once per timestep (beginning-of-step).
-        if self.tstep > 1_000:
-            with torch.no_grad():
-                self.advance_boundary_state()
-                if not self.just_move_bool:
-                    self.advance_stretch_state(x, p_mask)
 
         # Refresh potential neighbours at most once per timestep (KDTree), then reuse idx for both stages.
         self.refresh_potential_neighbours_once(x, self.k)
@@ -794,6 +619,9 @@ class Simulation:
 
             xi_q = torch.empty_like(q).normal_()
             xi_q = xi_q - torch.sum(xi_q * q, dim=1, keepdim=True) * q
+
+            xi_alpha_par = torch.empty_like(alpha_par).normal_()
+            xi_alpha_perp = torch.empty_like(alpha_perp).normal_()
 
             # Predictor state
             x_tilde = x.clone()
@@ -870,32 +698,8 @@ class Simulation:
                     gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt) #+ (eta * xi_gamma[mask] * self.sqrt_dt)
 
             # Final constraints
-            p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
-
-        with torch.no_grad():
-            if self.just_move_bool and self.stretch_factor != 0.0:   # Just move the second cell type in x direction for stretching purposes. This is used for the control experiment where we want to see the effect of just moving the cells without any change in the potential.
-                x[:,0][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,0] - self.x_mass_midpoint)   # Just move the second cell type in x direction for stretching purposes. This is used for the control experiment where we want to see the effect of just moving the cells without any change in the potential.
-                if self.tstep >= self.stretch_time_stop:
-                    self.stretch_factor = 0.0
-                    # delete cells for p_mask == 1
-                    x = x[p_mask != 1]
-                    p = p[p_mask != 1]
-                    q = q[p_mask != 1]
-                    gamma = gamma[p_mask != 1]
-                    alpha_par = alpha_par[p_mask != 1]
-                    alpha_perp = alpha_perp[p_mask != 1]
-                    p_mask = p_mask[p_mask != 1]
-
-                    x.requires_grad = True
-                    p.requires_grad = True
-                    q.requires_grad = True
-                    alpha_par.requires_grad = True
-                    alpha_perp.requires_grad = True
-                    gamma.requires_grad = True
-
-                    self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
-                    self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
-
+            p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)            
+            
         return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
@@ -1024,8 +828,6 @@ class Simulation:
 
         return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
 
-    
-
 def save(data_tuple, name, output_folder):
     """
     Saves the simulation data to a pickle file with dict structure.
@@ -1058,9 +860,6 @@ def save(data_tuple, name, output_folder):
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
         pickle.dump(data_dict, f)
-
-
-
 
 def run_simulation(sim_dict):
     """
@@ -1193,319 +992,3 @@ def run_simulation(sim_dict):
         print('Took', time() - t1, 'seconds')
 
     save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)  # Last iteration is saved
-
-def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
-    """
-    Generates cells uniformly distributed within a sphere with randomly
-    initialized polarities
-
-    Parameters
-        N (int): The number of cells to generate.
-        type0_frac (float): The fraction of cells of type 0.
-        radius (float): The radius of the sphere.
-
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-    """
-
-    # Generate random positions within a sphere
-    x = np.random.randn(N, 3)
-    r = radius * np.random.rand(N)**(1/3.)
-    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
-    x *= r[:, None]
-
-    # Generate random polarities
-    p = np.random.randn(N, 3)
-    p /= np.sqrt(np.sum(p**2, axis=1))[:,None]
-    q = np.random.randn(N, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate random cell types with specified fractions
-    mask = np.random.choice([0,1], p=[type0_frac, 1-type0_frac], size=N)                #Mask detailing which cells are which type
-
-    alpha_par = np.zeros(N)
-    alpha_perp = np.zeros(N)
-    gamma = np.zeros(N)
-
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
-    if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
-
-        # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
-
-        # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]        = np.log(gamma_params[1][0])
-    else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
-
-
-    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    return sphere_data
-
-def make_sphere_surface_stretch(N, stretch_frac, mirrored=True, 
-                               radius=30, alpha_params=None, gamma_params=None):
-    """
-    Generates cells uniformly distributed on a sphere 
-    with abp polarities pointing radially outward and randomly initialized pcp polarities.
-
-    Parameters
-        N (int): The number of cells to generate.
-        stretch_frac (float): The fraction of cells that will be stretched.
-        mirrored (bool): Whether to stretch to both sides or only 1.
-        radius (float): The radius of the sphere.
-
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-    """
-
-    # Generate random positions on a sphere
-    x = np.random.randn(N, 3)
-    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
-    x *= radius
-
-    # Generate apicobasal polarities pointing radially outward
-    p = x / np.linalg.norm(x, axis=1)[:, None]
-
-    # Generate random planar cell polarities
-    q = np.random.randn(N, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate cell types based on distance from the center
-    mask = np.zeros(N, dtype=int)
-    # All cells in the stretch_frace fraction of the radius from the center are type 1
-    # Sorting cells by their distance from the center
-    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-    if mirrored:
-        mask[sorted_indices[:int(N*stretch_frac/2)]] = 1
-        mask[sorted_indices[int(N*(1-stretch_frac/2)):]] = 1
-    else:
-        mask[sorted_indices[:int(N*stretch_frac)]] = 1
-
-    alpha_par = np.zeros(N)
-    alpha_perp = np.zeros(N)
-    gamma = np.zeros(N)
-
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
-    if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
-
-        # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
-
-        # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]        = np.log(gamma_params[1][0])
-    else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
-
-
-    sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    return sphere_data
-
-def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
-    """
-    Generates cells in the xy-plane with abp polarities pointing in the z-direction and randomly initialized pcp polarities.
-    N is a side so the total number of cells is N^2.
-    Cells are initially placed in a grid 2 units apart.
-    The stretch_frac works as in make_sphere_surface_stretch,
-        stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
-        size (float): The size of the plain.
-
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-            - alpha_par (np.ndarray): The parallel alpha parameter for each cell.
-            - alpha_perp (np.ndarray): The perpendicular alpha parameter for each cell.
-            - gamma_par (np.ndarray): The parallel gamma (elongation) parameter for each cell.
-            - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
-    """
-
-    # Generate grid positions in the xy-plane
-    x = np.array([[i*2, j*2, 0] for i in range(N) for j in range(N)], dtype=float)
-
-    # Generate apicobasal polarities pointing in the z-direction
-    p = np.array([[0, 0, 1] for _ in range(N**2)], dtype=float)
-
-    # Generate random planar cell polarities
-    q = np.array([[0, 1, 0] for _ in range(N**2)], dtype=float)
-    # q = np.random.randn(N**2, 3)
-    # q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate cell types based on distance from the center
-    mask = np.zeros(N**2, dtype=int)
-    # All cells in the stretch_frace fraction of the radius from the center are type 1
-    # Sorting cells by their distance from the center
-    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-
-    mask[sorted_indices[:int(N**2 * stretch_frac/2)]] = 1
-    mask[sorted_indices[int(N**2 * (1-stretch_frac/2)):]] = 1
-
-    alpha_par = np.zeros(N**2)
-    alpha_perp = np.zeros(N**2)
-    gamma = np.zeros(N**2)
-
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
-    if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
-
-        # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
-
-        # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]       = np.log(gamma_params[1][0])
-    else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
-
-    plain_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-
-    return plain_data
-
-def make_stretch_cylinder(N, stretch_frac, mirrored=True, radius=10, length=30, alpha_params=None, gamma_params=None):
-    """
-    Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
-
-    Parameters
-        N (int): The number of cells to generate.
-        stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
-        mirrored (bool): Whether to stretch to both sides or only 1.
-        radius (float): The radius of the cylinder.
-        length (float): The length of the cylinder.
-
-    Returns
-        tuple: A tuple containing the following elements:
-            - mask (np.ndarray): The mask indicating the type of each cell.
-            - x (np.ndarray): The positions of the cells.
-            - p (np.ndarray): The apicobasal polarities of the cells.
-            - q (np.ndarray): The planar cell polarities of the cells
-            - alpha_par (np.ndarray): The parallel alpha parameter for each cell.
-            - alpha_perp (np.ndarray): The perpendicular alpha parameter for each cell.
-            - gamma_par (np.ndarray): The parallel gamma (elongation) parameter for each cell.
-            - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
-    """
-
-    # Generate random positions on a cylinder
-    theta = np.random.rand(N) * 2 * np.pi
-    z = np.random.rand(N) * length - length/2  # Random z values between -length/2 and length/2
-    x = np.zeros((N, 3))
-    x[:, 0] = radius * np.cos(theta)
-    x[:, 1] = radius * np.sin(theta)
-    x[:, 2] = z
-
-    # Generate apicobasal polarities pointing radially outward
-    p = np.zeros_like(x)
-    p[:, 0] = np.cos(theta)
-    p[:, 1] = np.sin(theta)
-
-    # Generate planar cell polarities pointing around the cylinder
-    q = np.zeros_like(x)
-    q[:, 0] = -np.sin(theta)
-    q[:, 1] = np.cos(theta)
-    q[:, 2] = 0
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
-
-    # Generate cell types based on distance from the center
-    mask = np.zeros(N, dtype=int)
-    # All cells in the stretch_frace fraction of the radius from the center are type 1
-    # Sorting cells by their distance from the center
-    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
-    if mirrored:
-        mask[sorted_indices[:int(N*stretch_frac/2)]] = 1
-        mask[sorted_indices[int(N*(1-stretch_frac/2)):]] = 1
-    else:
-        mask[sorted_indices[:int(N*stretch_frac)]] = 1
-    alpha_par = np.zeros(N)
-    alpha_perp = np.zeros(N)
-    gamma = np.zeros(N)
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
-    if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
-
-        # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
-
-        # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]       = np.log(gamma_params[1][0])
-    else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
-
-    cylinder_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    return cylinder_data
-
-def make_4cells_on_string(mask=None, alpha_params=None, gamma_params=None):
-    x = np.array([[-3,0,0], [-1,0,0], [1,0,0], [3,0,0]])
-    p = np.array([[0,1,0], [0,1,0], [0,1,0], [0,1,0]])
-    q = np.array([[0,0,1], [0,0,1], [0,0,1], [0,0,1]])
-    if mask is None:
-        print('We doing mixed types')
-        mask = np.array([1,0,1,0])                
-
-    alpha_par = np.zeros(4)
-    alpha_perp = np.zeros(4)
-    gamma = np.zeros(4)
-
-    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
-    if np.unique(mask).size > 1:
-        
-        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
-        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
-
-        # Setting initial alpha values
-        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
-        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
-        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
-        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
-
-        # Setting initial gamma values
-        gamma[mask == 0]        = np.log(gamma_params[0][0])
-        gamma[mask == 1]        = np.log(gamma_params[1][0])
-    else:
-        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
-        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
-        gamma[:]        = np.log(gamma_params[0])
-
-
-    string_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
-    return string_data

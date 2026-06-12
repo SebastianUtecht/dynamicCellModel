@@ -1234,8 +1234,9 @@ def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
     p = np.array([[0, 0, 1] for _ in range(N**2)], dtype=float)
 
     # Generate random planar cell polarities
-    q = np.random.randn(N**2, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+    q = np.array([[1, 0, 0] for _ in range(N**2)], dtype=float)
+    # q = np.random.randn(N**2, 3)
+    # q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
 
     # Generate cell types based on distance from the center
     mask = np.zeros(N**2, dtype=int)

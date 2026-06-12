@@ -61,6 +61,8 @@ class Simulation:
         self.update_cells_bools = sim_dict['update_cells_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
         self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
         self.wedge_pcp = sim_dict['wedge_pcp']                     # Whether to apply wedging rotations to the PCP as well as the ABP. Only relevant if alpha parameters are non-zero
+        self.individual_rotation = sim_dict['individual_rotation']           # Whether to apply the wedging rotations individually to each neighbor based on their relative position, or to apply a single rotation based on the mean neighbor position. Only relevant if wedge_pcp is True
+        self.old_rotation = sim_dict['old_rotation']                     # Whether to use the old method of calculating the rotated ABP vectors, which was based on a simple tangent calculation, or the new method, which uses Rodrigues' rotation formula. The new method is more accurate and can handle larger angles, but the old method is faster and can be sufficient for small angles. Only relevant if alpha parameters are non-zero
         # Boundary parameters
         self.bound_type         = sim_dict['bound_type']
         assert self.bound_type == 'planes' or self.bound_type == 'cylinder' or self.bound_type == None, 'Boundtype expected to be in ["planes", "cylinder", None]'
@@ -205,9 +207,21 @@ class Simulation:
             # cKD-tree method
             x_cpu = x.cpu().numpy()
             tree = cKDTree(x_cpu)
-            d, idx = tree.query(x_cpu, k=k+1)  # Get the k+1 nearest neighbors (including self)
+            n_cells = x_cpu.shape[0]
+            k_query = min(k + 1, n_cells)
+            d, idx = tree.query(x_cpu, k=k_query)  # Get the k+1 nearest neighbors (including self)
             d = torch.from_numpy(d).to(x.device).to(x.dtype)
             idx = torch.from_numpy(idx).to(x.device).long()
+
+            # Handle 1D case (when k_query == 1, only self is returned)
+            if k_query == 1:
+                # For single-cell query, expand dimensions
+                d = d.unsqueeze(1)
+                idx = idx.unsqueeze(1)
+            elif d.ndim == 1:
+                # Convert 1D arrays to 2D if needed
+                d = d.unsqueeze(1)
+                idx = idx.unsqueeze(1)
 
         return d[:, 1:], idx[:, 1:]                             # Return distances and indices of neighbors. Note that we do not return the self-neighbor
 
@@ -516,15 +530,15 @@ class Simulation:
         pj = p[idx]
         qi = q[:, None, :].expand(q.shape[0], idx.shape[1], 3)
         qj = q[idx]
-        if self.use_q_mean:
-            q_mean = (qi + qj)
-            q_mean = self.safe_normalize(q_mean, dim=2)
+        # if self.use_q_mean:
+        q_mean = (qi + qj)
+        q_mean = self.safe_normalize(q_mean, dim=2)
 
-            p_mean = (pi + pj)
-            p_mean = self.safe_normalize(p_mean, dim=2)
-        else:
-            q_mean = qi
-            p_mean = pi
+        p_mean = (pi + pj)
+        p_mean = self.safe_normalize(p_mean, dim=2)
+        # else:
+        #     q_mean = qi
+        #     p_mean = pi
         
         # Expanding alpha_par, alpha_perp
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
@@ -535,26 +549,102 @@ class Simulation:
         alpha_perp_j = alpha_perp[idx]
         alpha_perp_mean = (alpha_perp_i + alpha_perp_j) / 2.0
 
-        q_axis = q_mean
-        perp_axis = self.safe_normalize(torch.cross(q_mean, p_mean, dim=2), dim=2)
+        # REDO THIS VIA MEANING OVER q, p and the rest. 
+        # THE WAY IT IS DONE RIGHT NOW BREAKS SYMMETRY
 
-        c_par = torch.sum(q_axis * dx, dim=2)
-        c_perp = torch.sum(perp_axis * dx, dim=2)
+        if self.individual_rotation:
+            perp_axis_i = self.safe_normalize(torch.cross(qi, pi, dim=2), dim=2)
+            perp_axis_j = self.safe_normalize(torch.cross(qj, pj, dim=2), dim=2)
 
-        #Implementing cell wedging via rotations (axis-angle)
-        omega_i = 0.5 * (alpha_par_mean[:,:,None] * c_par[:,:,None] * perp_axis - alpha_perp_mean[:,:,None] * c_perp[:,:,None] * q_axis)
-        omega_j = -omega_i
+            c_par_i = torch.sum(qi * dx, dim=2)
+            c_par_j = torch.sum(qj * dx, dim=2)
+            c_perp_i = torch.sum(perp_axis_i * dx, dim=2)
+            c_perp_j = torch.sum(perp_axis_j * dx, dim=2)
 
-        axis_i = self.safe_normalize(omega_i, dim=2)
-        angle_i = torch.linalg.norm(omega_i, dim=2)
+            par_angles_i = alpha_par_mean * c_par_i
+            par_angles_j = alpha_par_mean * c_par_j
+            perp_angles_i = alpha_perp_mean * c_perp_i
+            perp_angles_j = alpha_perp_mean * c_perp_j
+
+            tan_par_i = torch.tan(par_angles_i/2)
+            tan_par_j = torch.tan(-par_angles_j/2)
+            tan_perp_i = torch.tan(perp_angles_i/2)
+            tan_perp_j = torch.tan(-perp_angles_j/2)
+
+            arrival_vec_i = tan_par_i[:,:,None] * qi + tan_perp_i[:,:,None] * perp_axis_i + pi
+            arrival_vec_i = self.safe_normalize(arrival_vec_i, dim=2)
+            arrival_vec_j = tan_par_j[:,:,None] * qj + tan_perp_j[:,:,None] * perp_axis_j + pj
+            arrival_vec_j = self.safe_normalize(arrival_vec_j, dim=2)
+
+            axis_i = torch.cross(pi, arrival_vec_i, dim=2)
+            angle_i = torch.atan2(torch.linalg.norm(axis_i, dim=2), torch.sum(pi * arrival_vec_i, dim=2))
+            axis_i = self.safe_normalize(axis_i, dim=2)
+
+            axis_j = torch.cross(pj, arrival_vec_j, dim=2)
+            angle_j = torch.atan2(torch.linalg.norm(axis_j, dim=2), torch.sum(pj * arrival_vec_j, dim=2))
+            axis_j = self.safe_normalize(axis_j, dim=2)
+        
+        else:
+        #creating an orthonormal basis
+            q_axis = self.safe_normalize(q_mean, dim=2)
+            p_axis = self.safe_normalize(p_mean, dim=2)
+            q_axis = q_axis - torch.sum(q_axis * p_axis, dim=2, keepdim=True) * p_axis
+            q_axis = self.safe_normalize(q_axis, dim=2)
+            perp_axis = torch.cross(q_axis, p_axis, dim=2)
+            perp_axis = self.safe_normalize(perp_axis, dim=2)
+
+            # q_perp = self.safe_normalize(q_mean - torch.sum(q_mean * p_mean, dim=2, keepdim=True) * p_mean, dim=2)
+            c_par = torch.sum(q_axis * dx, dim=2) * 1.1
+            c_perp = torch.sum(perp_axis * dx, dim=2)
+
+            # print('c_par:', torch.abs(c_par).mean().item(), torch.abs(c_par).max().item())
+            # print('c_perp:', torch.abs(c_perp).mean().item(), torch.abs(c_perp).max().item())
+
+            par_angles = alpha_par_mean * c_par
+            perp_angles = alpha_perp_mean * c_perp
+            tan_par = torch.tan(par_angles/2)
+            tan_perp = torch.tan(perp_angles/2)
+            arrival_vec = tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis + p_mean
+            arrival_vec = self.safe_normalize(arrival_vec, dim=2)
+
+            # if self.tstep % 2_00 == 0:
+            #     c_par_abs_mean = torch.abs(c_par).mean().item()
+            #     c_perp_abs_mean = torch.abs(c_perp).mean().item()
+            #     print(f"c_par abs mean: {c_par_abs_mean:.4f}, c_perp abs mean: {c_perp_abs_mean:.4f}")
+            
+            axis    = torch.cross(p_mean, arrival_vec, dim=2)
+            angle_i = torch.atan2(torch.linalg.norm(axis, dim=2), torch.sum(p_mean * arrival_vec, dim=2))
+            angle_j = -angle_i.clone()
+            axis_i  = self.safe_normalize(axis, dim=2)
+            axis_j  = axis_i.clone()
+
+                # Using the same rotation for i and j to preserve symmetry
+
         rot_mat_i = self.rotation_matrices_axis_angle(axis_i, angle_i)
-
-        axis_j = self.safe_normalize(omega_j, dim=2)
-        angle_j = torch.linalg.norm(omega_j, dim=2)
         rot_mat_j = self.rotation_matrices_axis_angle(axis_j, angle_j)
 
-        pi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
-        pj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
+        # pi_tilde_old = self.safe_normalize(pi + tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis, dim=2)
+        # pj_tilde_old = self.safe_normalize(pj - tan_par[:,:,None] * q_axis - tan_perp[:,:,None] * perp_axis, dim=2)
+        pi_tilde_new = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
+        pj_tilde_new = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
+
+        if self.old_rotation:
+            if self.tstep == 0:
+                print("Using old rotation method")
+            # pi_tilde = pi_tilde_old
+            # pj_tilde = pj_tilde_old
+        else:
+            if self.tstep == 0:
+                print("Using new rotation method" )
+            pi_tilde = pi_tilde_new
+            pj_tilde = pj_tilde_new
+
+        # #similarity between the two methods of calculating the rotated vectors. This is mainly for debugging, but it is good to keep an eye on it to make sure the rotation is doing what we think it is doing. If the similarity is very low then something is wrong with the rotation and we should investigate.
+        # if self.tstep % 1_000 == 0:
+        #     similarity_i = torch.sum(pi_tilde_new * pi_tilde_old, dim=2) / (torch.linalg.norm(pi_tilde_new, dim=2) * torch.linalg.norm(pi_tilde_old, dim=2) + 1e-8)
+        #     similarity_j = torch.sum(pj_tilde_new * pj_tilde_old, dim=2) / (torch.linalg.norm(pj_tilde_new, dim=2) * torch.linalg.norm(pj_tilde_old, dim=2) + 1e-8)
+        #     print('Similarity between rotation methods (should be close to 1):', similarity_i.mean().item(), similarity_j.mean().item())
+                
         if self.wedge_pcp:
             qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
             qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
@@ -572,6 +662,33 @@ class Simulation:
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
         S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
         S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
+
+
+        # print('S1', S1)
+        # print('\n')
+        # print('S2', S2)
+        # print('\n')
+        # torch.cross(pi_tilde, qi_tilde, dim=2)
+        #printing angle between pi_tilde and qi_tilde for debugging. This is mainly to check if the rotation is doing what we think it is doing. If the angles are very small then the rotation might not be working properly and we should investigate.
+        # in degrees for interpretability
+
+        # angle_pi_qi = torch.acos(torch.sum(pi_tilde * qi_tilde, dim=2) / (torch.linalg.norm(pi_tilde, dim=2) * torch.linalg.norm(qi_tilde, dim=2)))
+        # angle_pj_qj = torch.acos(torch.sum(pj_tilde * qj_tilde, dim=2) / (torch.linalg.norm(pj_tilde, dim=2) * torch.linalg.norm(qj_tilde, dim=2)))
+        # angle_pi_pj = torch.acos(torch.sum(pi_tilde * pj_tilde, dim=2) / (torch.linalg.norm(pi_tilde, dim=2) * torch.linalg.norm(pj_tilde, dim=2)))
+        # angle_qi_qj = torch.acos(torch.sum(qi_tilde * qj_tilde, dim=2) / (torch.linalg.norm(qi_tilde, dim=2) * torch.linalg.norm(qj_tilde, dim=2)))
+        # print('Angle between pi_tilde and qi_tilde:', (angle_pi_qi) / np.pi * 180)
+        # print('Angle between pj_tilde and qj_tilde:', (angle_pj_qj) / np.pi * 180)
+        # print('Angle between pi_tilde and pj_tilde:', (angle_pi_pj) / np.pi * 180)
+        # print('Angle between qi_tilde and qj_tilde:', (angle_qi_qj) / np.pi * 180)
+
+        # angle_pi_qi = torch.acos(torch.sum(pi * qi, dim=2) / (torch.linalg.norm(pi, dim=2) * torch.linalg.norm(qi, dim=2)))
+        # angle_pj_qj = torch.acos(torch.sum(pj * qj, dim=2) / (torch.linalg.norm(pj, dim=2) * torch.linalg.norm(qj, dim=2)))
+        # angle_pi_pj = torch.acos(torch.sum(pi * pj, dim=2) / (torch.linalg.norm(pi, dim=2) * torch.linalg.norm(pj, dim=2)))
+        # angle_qi_qj = torch.acos(torch.sum(qi * qj, dim=2) / (torch.linalg.norm(qi, dim=2) * torch.linalg.norm(qj, dim=2)))
+        # print('Angle between pi and qi:', (angle_pi_qi) / np.pi * 180)
+        # print('Angle between pj and qj:', (angle_pj_qj) / np.pi * 180)
+        # print('Angle between pi and pj:', (angle_pi_pj) / np.pi * 180)
+        # print('Angle between qi and qj:', (angle_qi_qj) / np.pi * 180)
 
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
@@ -1509,3 +1626,81 @@ def make_4cells_on_string(mask=None, alpha_params=None, gamma_params=None):
 
     string_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
     return string_data
+
+def make_two_particles_on_string(q_dir,p_mask=None,alpha_params=None, gamma_params=None):
+    """Create a simulation with exactly 2 cells for testing."""
+    # Create 2 particles on a 1D string
+    x = np.array([[-1, 0, 0], [1, 0, 0]])
+    p = np.array([[0, 1, 0], [0, 1, 0]])
+    q = np.zeros_like(p)
+    q[:, q_dir] = 1
+    print(q)
+    if p_mask is None:    
+        mask = np.array([0, 0])  # Two different cell types for testing
+    else:
+        mask = p_mask
+
+    alpha_par = np.zeros(2)
+    alpha_perp = np.zeros(2)
+    gamma = np.zeros(2)
+
+    # Check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        assert isinstance(alpha_params[0], list), "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list), "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0] = alpha_params[0][0][0] * np.pi / 180.0
+        alpha_perp[mask == 0] = alpha_params[0][1][0] * np.pi / 180.0
+        alpha_par[mask == 1] = alpha_params[1][0][0] * np.pi / 180.0
+        alpha_perp[mask == 1] = alpha_params[1][1][0] * np.pi / 180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0] = np.log(gamma_params[0][0])
+        gamma[mask == 1] = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:] = alpha_params[0][0] * np.pi / 180.0
+        alpha_perp[:] = alpha_params[1][0] * np.pi / 180.0
+        gamma[:] = np.log(gamma_params[0])
+
+    two_cell_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return two_cell_data
+
+def make_three_particles_on_string(q_dir,p_mask=None,alpha_params=None, gamma_params=None):
+    """Create a simulation with exactly 3 cells for testing."""
+    # Create 3 particles on a 1D string
+    x = np.array([[-2, 0, 0], [0, 0, 0], [2, 0, 0]])
+    p = np.array([[0, 1, 0], [0, 1, 0], [0, 1, 0]])
+    q = np.zeros_like(p)
+    q[:, q_dir] = 1
+    print(q)
+    if p_mask is None:    
+        mask = np.array([0, 0, 0])  # Two different cell types for testing
+    else:
+        mask = p_mask
+
+    alpha_par = np.zeros(3)
+    alpha_perp = np.zeros(3)
+    gamma = np.zeros(3)
+
+    # Check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        assert isinstance(alpha_params[0], list), "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list), "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0] = alpha_params[0][0][0] * np.pi / 180.0
+        alpha_perp[mask == 0] = alpha_params[0][1][0] * np.pi / 180.0
+        alpha_par[mask == 1] = alpha_params[1][0][0] * np.pi / 180.0
+        alpha_perp[mask == 1] = alpha_params[1][1][0] * np.pi / 180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0] = np.log(gamma_params[0][0])
+        gamma[mask == 1] = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:] = alpha_params[0][0] * np.pi / 180.0
+        alpha_perp[:] = alpha_params[1][0] * np.pi / 180.0
+        gamma[:] = np.log(gamma_params[0])
+    
+    three_cell_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+    return three_cell_data

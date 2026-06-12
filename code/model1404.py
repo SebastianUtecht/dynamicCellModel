@@ -577,8 +577,8 @@ class Simulation:
         # Implementing cell wedging via rotations (axis-angle)
         # Each cell rotates by half the mean angle; direction depends on neighbour position.
         # Convention: if alpha_i == alpha_j == alpha, then each side rotates by alpha/2 (not alpha/4).
-        half_alpha_par = alpha_par_mean
-        half_alpha_perp = alpha_perp_mean
+        half_alpha_par = alpha_par_mean / 2.0
+        half_alpha_perp = alpha_perp_mean / 2.0
 
         # Axes
         q_axis = q_mean

@@ -8,6 +8,7 @@ import pickle
 from time import time
 import json
 
+
 ### Simulation ###
 class Simulation:
     """
@@ -60,7 +61,7 @@ class Simulation:
         self.nematic_pcp    = sim_dict['nematic_pcp']     # Whether planar cell polarity is nematic (True) or vectorial (False)
         self.update_cells_bools = sim_dict['update_cells_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
         self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
-        self.wedge_pcp = sim_dict['wedge_pcp']                     # Whether to apply wedging rotations to the PCP as well as the ABP. Only relevant if alpha parameters are non-zero
+
         # Boundary parameters
         self.bound_type         = sim_dict['bound_type']
         assert self.bound_type == 'planes' or self.bound_type == 'cylinder' or self.bound_type == None, 'Boundtype expected to be in ["planes", "cylinder", None]'
@@ -142,14 +143,12 @@ class Simulation:
         torch.manual_seed(self.random_seed)                 # For reproducibility
         self.tstep = 0
     
-    #Checked
     def elong_func_linear(self, q_mean, dx):
         dot = (q_mean * dx).sum(dim=2)
         dot = torch.abs(dot)
         elong =  1 - 4/np.pi * torch.arccos(dot)
         return elong
     
-    #Checked
     def elong_func_cos(self, q_mean, dx):
         return 2 * ((q_mean * dx).sum(dim=2))**2 - 1
 
@@ -158,46 +157,6 @@ class Simulation:
         n = torch.linalg.norm(v, dim=dim, keepdim=True)
         return v / torch.clamp(n, min=eps)
 
-    def rotation_matrices_axis_angle(self, axis, angle, eps: float = 1e-12):
-        """Create rotation matrices from axis-angle (Rodrigues)
-
-        Parameters:
-            axis: (..., 3) rotation axes
-            angle: (...) rotation angles (radians)
-        Returns:
-            R: (..., 3, 3)
-        """
-
-        axis_norm = torch.linalg.norm(axis, dim=-1)
-        valid = axis_norm > eps
-
-        # Normalised axis; value doesn't matter where invalid because angle will be zeroed.
-        u = axis / torch.clamp(axis_norm, min=eps)[..., None]
-        angle = angle * valid.to(angle.dtype)
-
-        ux, uy, uz = u.unbind(dim=-1)
-        zero = torch.zeros_like(ux)
-
-        K = torch.stack(
-            (
-                torch.stack((zero, -uz, uy), dim=-1),
-                torch.stack((uz, zero, -ux), dim=-1),
-                torch.stack((-uy, ux, zero), dim=-1),
-            ),
-            dim=-2,
-        )
-
-        I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand(axis.shape[:-1] + (3, 3))
-
-        theta = angle[..., None, None]
-        c = torch.cos(theta)
-        s = torch.sin(theta)
-        one_minus_c = 1.0 - c
-
-        uuT = u[..., :, None] * u[..., None, :]
-        R = c * I + one_minus_c * uuT + s * K
-        return R
-    
     @staticmethod
     def find_potential_neighbours(x, k):
 
@@ -530,37 +489,49 @@ class Simulation:
         alpha_par_i = alpha_par[:, None].expand(alpha_par.shape[0], idx.shape[1])
         alpha_par_j = alpha_par[idx]
         alpha_par_mean = (alpha_par_i + alpha_par_j) / 2.0
-
+        alpha_par_mean = torch.tan(alpha_par_mean/2)
         alpha_perp_i = alpha_perp[:, None].expand(alpha_perp.shape[0], idx.shape[1])
         alpha_perp_j = alpha_perp[idx]
         alpha_perp_mean = (alpha_perp_i + alpha_perp_j) / 2.0
+        alpha_perp_mean = torch.tan(alpha_perp_mean/2)
 
-        q_axis = q_mean
-        perp_axis = self.safe_normalize(torch.cross(q_mean, p_mean, dim=2), dim=2)
+        # Implementing cell wedging
+        perp_dir = torch.cross(q_mean, p_mean, dim=2)
+        perp_dir = self.safe_normalize(perp_dir, dim=2)
 
-        c_par = torch.sum(q_axis * dx, dim=2)
-        c_perp = torch.sum(perp_axis * dx, dim=2)
+        Z_par = alpha_par_mean[:,:,None] * (q_mean * dx).sum(dim=2)[:,:,None] * q_mean                                    
+        Z_perp = alpha_perp_mean[:,:,None] * (perp_dir * dx).sum(dim=2)[:,:,None] * perp_dir                                
+        Z = Z_par + Z_perp
 
-        #Implementing cell wedging via rotations (axis-angle)
-        omega_i = 0.5 * (alpha_par_mean[:,:,None] * c_par[:,:,None] * perp_axis - alpha_perp_mean[:,:,None] * c_perp[:,:,None] * q_axis)
-        omega_j = -omega_i
 
-        axis_i = self.safe_normalize(omega_i, dim=2)
-        angle_i = torch.linalg.norm(omega_i, dim=2)
-        rot_mat_i = self.rotation_matrices_axis_angle(axis_i, angle_i)
+        #debugging baybee
+        print('alphas')
+        print('alpha_par_mean:', alpha_par_mean.mean().item())
+        print('alpha_perp_mean:', alpha_perp_mean.mean().item())
+        print('\n')
+        print('dot products')
+        print('q_mean * dx:', torch.abs((q_mean * dx).sum(dim=2)[:,:,None]).mean().item())
+        print('perp_dir * dx:', torch.abs((perp_dir * dx).sum(dim=2)[:,:,None]).mean().item())
+        print('\n')
+        print('vector lengths')
+        print('qmean:', torch.sqrt(torch.sum(q_mean**2, dim=2)).mean().item())
+        print('perp_dir:', torch.sqrt(torch.sum(perp_dir**2, dim=2)).mean().item())
+        print('Z_par:', torch.sqrt(torch.sum(Z_par**2, dim=2)).mean().item())
+        print('Z_perp:', torch.sqrt(torch.sum(Z_perp**2, dim=2)).mean().item())
+        print('Z:', torch.sqrt(torch.sum(Z**2, dim=2)).mean().item())
+        print('\n')
 
-        axis_j = self.safe_normalize(omega_j, dim=2)
-        angle_j = torch.linalg.norm(omega_j, dim=2)
-        rot_mat_j = self.rotation_matrices_axis_angle(axis_j, angle_j)
 
-        pi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
-        pj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
-        if self.wedge_pcp:
-            qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
-            qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
-        else:
-            qi_tilde = qi
-            qj_tilde = qj
+        pi_tilde = pi - Z
+        pj_tilde = pj + Z
+
+        # Normalizing the ABPs
+        # wedged_interactions = torch.any((alpha_par_mean > 1e-5) | (alpha_perp_mean > 1e-5), dim=2)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        wedged_interactions = torch.logical_or(alpha_par_mean > 1e-5, alpha_perp_mean > 1e-5)     # We only normalize the ABPs for wedged interactions, otherwise we mess with the non-wedged interactions for no reason
+        pi_tilde[wedged_interactions] = self.safe_normalize(pi_tilde[wedged_interactions], dim=1)
+        pj_tilde[wedged_interactions] = self.safe_normalize(pj_tilde[wedged_interactions], dim=1)
+        # pi_tilde[wedged_interactions] = pi_tilde[wedged_interactions] / torch.sqrt(torch.sum(pi_tilde[wedged_interactions] ** 2, dim=1))[:, None]
+        # pj_tilde[wedged_interactions] = pj_tilde[wedged_interactions] / torch.sqrt(torch.sum(pj_tilde[wedged_interactions] ** 2, dim=1))[:, None]
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
@@ -570,8 +541,8 @@ class Simulation:
 
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
-        S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
-        S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
+        S2 = torch.sum(torch.cross(pi_tilde, qi, dim=2) * torch.cross(pj_tilde, qj, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
+        S3 = torch.sum(torch.cross(qi, dx, dim=2) * torch.cross(qj, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
 
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
@@ -794,6 +765,9 @@ class Simulation:
 
             xi_q = torch.empty_like(q).normal_()
             xi_q = xi_q - torch.sum(xi_q * q, dim=1, keepdim=True) * q
+
+            xi_alpha_par = torch.empty_like(alpha_par).normal_()
+            xi_alpha_perp = torch.empty_like(alpha_perp).normal_()
 
             # Predictor state
             x_tilde = x.clone()
@@ -1112,6 +1086,8 @@ def run_simulation(sim_dict):
             alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
             gamma[:]        = np.log(gamma_params[0])
 
+
+
     elif isinstance(data, tuple):
         # Data generation tuple construction: (data_gen, data_gen_args)
         print('Using data generation function')
@@ -1354,9 +1330,8 @@ def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
     p = np.array([[0, 0, 1] for _ in range(N**2)], dtype=float)
 
     # Generate random planar cell polarities
-    q = np.array([[0, 1, 0] for _ in range(N**2)], dtype=float)
-    # q = np.random.randn(N**2, 3)
-    # q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+    q = np.random.randn(N**2, 3)
+    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
 
     # Generate cell types based on distance from the center
     mask = np.zeros(N**2, dtype=int)
