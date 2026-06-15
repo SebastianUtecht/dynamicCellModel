@@ -53,15 +53,6 @@ class Simulation:
             self.eta_lst = [self.eta0]
         else:
             raise ValueError("etas should be either a list of two values or a single value")
-        polar_etas = sim_dict['polar_etas']  # Noise strength for polarity updates
-        if isinstance(polar_etas, list):
-            self.polar_eta0, self.polar_eta1 = polar_etas
-            self.polar_eta_lst = [self.polar_eta0, self.polar_eta1]
-        elif isinstance(polar_etas, (float, int)):
-            self.polar_eta0 = self.polar_eta1 = polar_etas
-            self.polar_eta_lst = [self.polar_eta0]
-        else:
-            raise ValueError("polar_etas should be either a list of two values or a single value")
         self.alpha_params   = sim_dict['alpha_params']      # Determines how cells wedge
         self.gamma_params   = sim_dict['gamma_params']      # Determines how cells elongate
         self.prolif_rate    = sim_dict['prolif_rate']       # Probability of cell proliferation for each cell
@@ -666,8 +657,6 @@ class Simulation:
 
         exponent, gamma_i, gamma_j = self.get_gamma_exponent(dx, pi, pj, q_mean, idx, gamma)
         d_tilde = d * torch.exp(exponent)
-        # d_tilde = d
-        # print(torch.exp(exponent).mean().item(), torch.exp(exponent).max().item())
 
         # All the S-terms are calculated
         S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
@@ -701,6 +690,8 @@ class Simulation:
         # print('Angle between pi and pj:', (angle_pi_pj) / np.pi * 180)
         # print('Angle between qi and qj:', (angle_qi_qj) / np.pi * 180)
 
+        S1_original = S1.clone()  # Store original S1 for export
+        S2_original = S2.clone()  # Store original S2 for export
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
             S2 = torch.abs(S2)              # We take the absolute value of S2 as we only care about the strength of the interaction, not the direction. This is because we have already taken care of the directionality in the way we construct pi_tilde and pj_tilde
@@ -782,7 +773,7 @@ class Simulation:
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
-        return V , Vi
+        return V, Vi, S1_original, S2_original
 
     def init_simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -888,6 +879,7 @@ class Simulation:
 
         # Start with cell division
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
+        # self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         # Advance any stateful boundary/stretch logic once per timestep (beginning-of-step).
         if self.tstep > 1_000:
@@ -902,7 +894,7 @@ class Simulation:
 
         # 
         d1, dx1, idx1, z_mask1 = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
-        V1, Vi = self.potential(x, p, q, p_mask,
+        V1, Vi, S1_yield, S2_yield = self.potential(x, p, q, p_mask,
                                 alpha_par, alpha_perp, gamma,
                                 d1, dx1, idx1, z_mask1)
 
@@ -935,11 +927,9 @@ class Simulation:
                     continue
                 mask = p_mask == i
 
-                polar_eta = self.polar_eta_lst[i]
-
                 x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p_tilde[mask] += (-g1_p[mask] * self.dt) + (polar_eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the predictor, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
-                q_tilde[mask] += (-g1_q[mask] * self.dt) + (polar_eta * xi_q[mask] * self.sqrt_dt)
+                p_tilde[mask] += (-g1_p[mask] * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the predictor, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
+                q_tilde[mask] += (-g1_q[mask] * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
 
                 if self.alpha_par_bool_lst[i]:
                     alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt)    #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
@@ -967,7 +957,7 @@ class Simulation:
         # Stage 2 (drift at X~)
         # ------------------------
         d2, dx2, idx2, z_mask2 = self.true_neighbours_from_idx(x_tilde, p_tilde, q_tilde, gamma_tilde, idx_base)
-        V2, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
+        V2, _, _, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
                                alpha_par_tilde, alpha_perp_tilde, gamma_tilde,
                                d2, dx2, idx2, z_mask2)
 
@@ -975,6 +965,13 @@ class Simulation:
             V2, (x_tilde, p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde),
             create_graph=False, retain_graph=False
         )
+
+        # Capture gradients for export before corrector step
+        with torch.no_grad():
+            V_total = V1 + V2  # Total potential energy
+            xgrad_export = 0.5 * (g1_x + g2_x).detach().clone()  # Average of two stages
+            pgrad_export = 0.5 * (g1_p + g2_p).detach().clone()
+            qgrad_export = 0.5 * (g1_q + g2_q).detach().clone()
 
         # ------------------------
         # Corrector (Heun)
@@ -1025,7 +1022,7 @@ class Simulation:
                     self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
                     self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
 
-        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi  #Returning the goods.
+        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi, V_total, S1_yield, S2_yield, xgrad_export, pgrad_export, qgrad_export  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -1048,7 +1045,7 @@ class Simulation:
 
         tstep = 0
         while True:
-            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy, energy_total, S1_data, S2_data, xgrad_data, pgrad_data, qgrad_data = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
             
             tstep += 1
             self.tstep = tstep
@@ -1071,7 +1068,15 @@ class Simulation:
                 energy = energy.detach().to("cpu").numpy().copy()
                 pp_mask = p_mask.detach().to("cpu").numpy().copy()
                 
-                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy                                  # Yielding the data baybeeee
+                # Convert new data to numpy
+                Etot = energy_total.detach().to("cpu").numpy().copy() if isinstance(energy_total, torch.Tensor) else np.array([energy_total])
+                S1_array = S1_data.detach().to("cpu").numpy().copy()
+                S2_array = S2_data.detach().to("cpu").numpy().copy()
+                xgrad_array = xgrad_data.detach().to("cpu").numpy().copy()
+                pgrad_array = pgrad_data.detach().to("cpu").numpy().copy()
+                qgrad_array = qgrad_data.detach().to("cpu").numpy().copy()
+                
+                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy, Etot, S1_array, S2_array, xgrad_array, pgrad_array, qgrad_array                                  # Yielding the data baybeeee
     
     def cell_division(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -1160,14 +1165,14 @@ def save(data_tuple, name, output_folder):
     Saves the simulation data to a pickle file with dict structure.
 
     Parameters:
-        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst)
+        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst)
         name (str): The name of the file (without extension).
         output_folder (str): The folder to save the file in.
 
     Returns:
         None, but saves the data
     """
-    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst = data_tuple
+    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst = data_tuple
 
     energy_lst_copy = energy_lst.copy()
     last_energy = np.zeros_like(p_mask_lst[-1])
@@ -1182,7 +1187,13 @@ def save(data_tuple, name, output_folder):
         'alpha_par': alpha_par_lst,
         'alpha_perp': alpha_perp_lst,
         'gamma': gamma_lst,
-        'energy': energy_lst_copy
+        'energy': energy_lst_copy,
+        'Etot': Etot_lst,
+        'S1': S1_lst,
+        'S2': S2_lst,
+        'xgrad': xgrad_lst,
+        'pgrad': pgrad_lst,
+        'qgrad': qgrad_lst
     }
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
@@ -1275,6 +1286,12 @@ def run_simulation(sim_dict):
     alpha_perp_lst = [alpha_perp * 180.0/np.pi]
     gamma_lst = [np.exp(gamma)]
     energy_lst = []
+    Etot_lst = []
+    S1_lst = []
+    S2_lst = []
+    xgrad_lst = []
+    pgrad_lst = []
+    qgrad_lst = []
 
     # we make an initial energy
 
@@ -1284,7 +1301,7 @@ def run_simulation(sim_dict):
         json.dump(sim_dict, f, indent = 2)
 
     # Save the initial simulation data
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)
 
     # Print the notes if verbose
     if verbose:
@@ -1296,7 +1313,7 @@ def run_simulation(sim_dict):
     t1 = time() # We timing stuff
 
     # Saving data at intervals specified by yield_every:
-    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy in itertools.islice(runner, yield_steps):
+    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy, Etot_data, S1_data, S2_data, xgrad_data, pgrad_data, qgrad_data in itertools.islice(runner, yield_steps):
         i += 1
         if verbose:
             print(f'Running {i} of {yield_steps}   ({yield_every * i} of {yield_every * yield_steps})   ({len(xx)} cells)', end='\r')
@@ -1309,19 +1326,25 @@ def run_simulation(sim_dict):
         alpha_perp_lst.append(alpha_perpperp)
         gamma_lst.append(gammagamma)
         energy_lst.append(energyenergy)
+        Etot_lst.append(Etot_data)
+        S1_lst.append(S1_data)
+        S2_lst.append(S2_data)
+        xgrad_lst.append(xgrad_data)
+        pgrad_lst.append(pgrad_data)
+        qgrad_lst.append(qgrad_data)
         
         if len(pp_mask) > sim_dict['max_cells']:
             break
         
         # Every 50 yield steps we dump the data
         if i % 50 == 0:
-            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)
     
     if verbose:
         print(f'Simulation done, saved {i} datapoints')
         print('Took', time() - t1, 'seconds')
 
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)  # Last iteration is saved
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
 def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
     """

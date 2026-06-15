@@ -2,3 +2,5 @@
 /data
 # Ignore any directory whose name contains "TESTING" (at any depth)
 **/*TESTING*/
+# Ignore folders with date format dd_mm_* (data folders)
+[0-9][0-9]_[0-9][0-9]_*/
