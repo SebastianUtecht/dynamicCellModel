@@ -53,15 +53,6 @@ class Simulation:
             self.eta_lst = [self.eta0]
         else:
             raise ValueError("etas should be either a list of two values or a single value")
-        polar_etas = sim_dict['polar_etas']  # Noise strength for polarity updates
-        if isinstance(polar_etas, list):
-            self.polar_eta0, self.polar_eta1 = polar_etas
-            self.polar_eta_lst = [self.polar_eta0, self.polar_eta1]
-        elif isinstance(polar_etas, (float, int)):
-            self.polar_eta0 = self.polar_eta1 = polar_etas
-            self.polar_eta_lst = [self.polar_eta0]
-        else:
-            raise ValueError("polar_etas should be either a list of two values or a single value")
         self.alpha_params   = sim_dict['alpha_params']      # Determines how cells wedge
         self.gamma_params   = sim_dict['gamma_params']      # Determines how cells elongate
         self.prolif_rate    = sim_dict['prolif_rate']       # Probability of cell proliferation for each cell
@@ -101,7 +92,7 @@ class Simulation:
         self.beta   = None                                      # Tensor used for cell division
         self.division = False                                   # Tensor used for cell division
 
-        # Locking or freeing the parameters for autograd
+        # Locking or freeing learnable parameters (bounds applied in apply_constraints)
 
         # Multiple cell types
         if isinstance(self.alpha_params[0], list):
@@ -147,7 +138,15 @@ class Simulation:
         self.use_trans_neighbors = True
         self.use_gamma_mean = sim_dict['use_gamma_mean']
         self.gamma_diff_penalty = sim_dict['gamma_diff_penalty']
-        self.gamma_update_speed = sim_dict['gamma_update_speed']    
+        self.gamma_update_speed = sim_dict['gamma_update_speed']
+
+        # Finite-difference step size for gradient computation
+        if 'fd_h' in sim_dict:
+            self.fd_h = sim_dict['fd_h']
+        else:
+            self.fd_h = 1e-6 if self.dtype == torch.float64 else 1e-4
+        if self.fd_h <= 0:
+            raise ValueError("fd_h must be positive")
 
         # Set random seed
         torch.manual_seed(self.random_seed)                 # For reproducibility
@@ -273,7 +272,7 @@ class Simulation:
                 break
 
         self.max_safe_batch = max_batch
-        print(f"Found max safe batch size: {self.max_safe_batch}")
+        # print(f"Found max safe batch size: {self.max_safe_batch}")
         del dummy_dx, dummy_d
         if self.device == "cuda":
             torch.cuda.empty_cache()
@@ -376,7 +375,8 @@ class Simulation:
                 
             batch_size = self.max_safe_batch
             if self.tstep % 50_000 == 0:
-                print(f"Using batch size: {batch_size} for true neighbor search.")
+                # print(f"Using batch size: {batch_size} for true neighbor search.")
+                pass
             i0 = 0
             while i0 < total_cells:
                 i1 = min(i0 + batch_size, total_cells)
@@ -391,7 +391,7 @@ class Simulation:
                         if self.device == "cuda":
                             torch.cuda.empty_cache()
                         batch_size = max(self.min_batch_size, int(batch_size // 1.2))
-                        print(f"OOM at cell {i0}. Reducing batch size to {batch_size}.")
+                        # print(f"OOM at cell {i0}. Reducing batch size to {batch_size}.")
                         continue
                     else:
                         raise e
@@ -594,89 +594,95 @@ class Simulation:
             axis_j = self.safe_normalize(axis_j, dim=2)
         
         else:
-        #creating an orthonormal basis
-            q_axis = self.safe_normalize(q_mean, dim=2)
-            p_axis = self.safe_normalize(p_mean, dim=2)
-            # q_axis = q_axis - torch.sum(q_axis * p_axis, dim=2, keepdim=True) * p_axis
-            # q_axis = self.safe_normalize(q_axis, dim=2)
-            perp_axis = torch.cross(q_axis, p_axis, dim=2)
-            perp_axis = self.safe_normalize(perp_axis, dim=2)
+            with torch.no_grad():
+                if self.tstep == 0:
+                    # print('we no-gradding')
+                    pass
+                #creating an orthonormal basis
+                q_axis = self.safe_normalize(q_mean, dim=2)
+                p_axis = self.safe_normalize(p_mean, dim=2)
+                # q_axis = q_axis - torch.sum(q_axis * p_axis, dim=2, keepdim=True) * p_axis
+                # q_axis = self.safe_normalize(q_axis, dim=2)
+                perp_axis = torch.cross(q_axis, p_axis, dim=2)
+                perp_axis = self.safe_normalize(perp_axis, dim=2)
 
-            # q_perp = self.safe_normalize(q_mean - torch.sum(q_mean * p_mean, dim=2, keepdim=True) * p_mean, dim=2)
-            c_par = torch.sum(q_axis * dx, dim=2)
-            c_perp = torch.sum(perp_axis * dx, dim=2)
+                # q_perp = self.safe_normalize(q_mean - torch.sum(q_mean * p_mean, dim=2, keepdim=True) * p_mean, dim=2)
+                c_par = torch.sum(q_axis * dx, dim=2)
+                c_perp = torch.sum(perp_axis * dx, dim=2)
 
-            # print('c_par:', torch.abs(c_par).mean().item(), torch.abs(c_par).max().item())
-            # print('c_perp:', torch.abs(c_perp).mean().item(), torch.abs(c_perp).max().item())
+                # print('c_par:', torch.abs(c_par).mean().item(), torch.abs(c_par).max().item())
+                # print('c_perp:', torch.abs(c_perp).mean().item(), torch.abs(c_perp).max().item())
 
-            par_angles = alpha_par_mean * c_par
-            perp_angles = alpha_perp_mean * c_perp
-            tan_par = torch.tan(par_angles/2)
-            tan_perp = torch.tan(perp_angles/2)
-            arrival_vec = tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis + p_mean
-            arrival_vec = self.safe_normalize(arrival_vec, dim=2)
+                par_angles = alpha_par_mean * c_par
+                perp_angles = alpha_perp_mean * c_perp
+                tan_par = torch.tan(par_angles/2)
+                tan_perp = torch.tan(perp_angles/2)
+                arrival_vec = tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis + p_mean
+                arrival_vec = self.safe_normalize(arrival_vec, dim=2)
 
-            # if self.tstep % 2_00 == 0:
-            #     c_par_abs_mean = torch.abs(c_par).mean().item()
-            #     c_perp_abs_mean = torch.abs(c_perp).mean().item()
-            #     print(f"c_par abs mean: {c_par_abs_mean:.4f}, c_perp abs mean: {c_perp_abs_mean:.4f}")
-            
-            axis    = torch.cross(p_mean, arrival_vec, dim=2)
-            angle_i = torch.atan2(torch.linalg.norm(axis, dim=2), torch.sum(p_mean * arrival_vec, dim=2))
-            angle_j = -angle_i.clone()
-            axis_i  = self.safe_normalize(axis, dim=2)
-            axis_j  = axis_i.clone()
-
-                # Using the same rotation for i and j to preserve symmetry
-
-        rot_mat_i = self.rotation_matrices_axis_angle(axis_i, angle_i)
-        rot_mat_j = self.rotation_matrices_axis_angle(axis_j, angle_j)
-
-        # pi_tilde_old = self.safe_normalize(pi + tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis, dim=2)
-        # pj_tilde_old = self.safe_normalize(pj - tan_par[:,:,None] * q_axis - tan_perp[:,:,None] * perp_axis, dim=2)
-        pi_tilde_new = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
-        pj_tilde_new = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
-
-        if self.old_rotation:
-            if self.tstep == 0:
-                print("Using old rotation method")
-            # pi_tilde = pi_tilde_old
-            # pj_tilde = pj_tilde_old
-        else:
-            if self.tstep == 0:
-                print("Using new rotation method" )
-            pi_tilde = pi_tilde_new
-            pj_tilde = pj_tilde_new
-
-        # #similarity between the two methods of calculating the rotated vectors. This is mainly for debugging, but it is good to keep an eye on it to make sure the rotation is doing what we think it is doing. If the similarity is very low then something is wrong with the rotation and we should investigate.
-        # if self.tstep % 1_000 == 0:
-        #     similarity_i = torch.sum(pi_tilde_new * pi_tilde_old, dim=2) / (torch.linalg.norm(pi_tilde_new, dim=2) * torch.linalg.norm(pi_tilde_old, dim=2) + 1e-8)
-        #     similarity_j = torch.sum(pj_tilde_new * pj_tilde_old, dim=2) / (torch.linalg.norm(pj_tilde_new, dim=2) * torch.linalg.norm(pj_tilde_old, dim=2) + 1e-8)
-        #     print('Similarity between rotation methods (should be close to 1):', similarity_i.mean().item(), similarity_j.mean().item())
+                # if self.tstep % 2_00 == 0:
+                #     c_par_abs_mean = torch.abs(c_par).mean().item()
+                #     c_perp_abs_mean = torch.abs(c_perp).mean().item()
+                #     print(f"c_par abs mean: {c_par_abs_mean:.4f}, c_perp abs mean: {c_perp_abs_mean:.4f}")
                 
-        # if self.wedge_pcp:
-        qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
-        qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
-        qi_tilde = self.safe_normalize(qi_tilde, dim=2)
-        qj_tilde = self.safe_normalize(qj_tilde, dim=2)
+                axis    = torch.cross(p_mean, arrival_vec, dim=2)
+                angle_i = torch.atan2(torch.linalg.norm(axis, dim=2), torch.sum(p_mean * arrival_vec, dim=2))
+                angle_j = -angle_i.clone()
+                axis_i  = self.safe_normalize(axis, dim=2)
+                axis_j  = axis_i.clone()
 
-        # else:
-        #     qi_tilde = qi
-        #     qj_tilde = qj
+                    # Using the same rotation for i and j to preserve symmetry
+
+                rot_mat_i = self.rotation_matrices_axis_angle(axis_i, angle_i)
+                rot_mat_j = self.rotation_matrices_axis_angle(axis_j, angle_j)
+
+                # pi_tilde_old = self.safe_normalize(pi + tan_par[:,:,None] * q_axis + tan_perp[:,:,None] * perp_axis, dim=2)
+                # pj_tilde_old = self.safe_normalize(pj - tan_par[:,:,None] * q_axis - tan_perp[:,:,None] * perp_axis, dim=2)
+
+                # if self.old_rotation:
+                #     if self.tstep == 0:
+                #         print("Using old rotation method")
+                #     # pi_tilde = pi_tilde_old
+                #     # pj_tilde = pj_tilde_old
+                # else:
+                #     if self.tstep == 0:
+                #         print("Using new rotation method" )
+                #     pi_tilde = pi_tilde_new
+                #     pj_tilde = pj_tilde_new
+
+                # #similarity between the two methods of calculating the rotated vectors. This is mainly for debugging, but it is good to keep an eye on it to make sure the rotation is doing what we think it is doing. If the similarity is very low then something is wrong with the rotation and we should investigate.
+                # if self.tstep % 1_000 == 0:
+                #     similarity_i = torch.sum(pi_tilde_new * pi_tilde_old, dim=2) / (torch.linalg.norm(pi_tilde_new, dim=2) * torch.linalg.norm(pi_tilde_old, dim=2) + 1e-8)
+                #     similarity_j = torch.sum(pj_tilde_new * pj_tilde_old, dim=2) / (torch.linalg.norm(pj_tilde_new, dim=2) * torch.linalg.norm(pj_tilde_old, dim=2) + 1e-8)
+                #     print('Similarity between rotation methods (should be close to 1):', similarity_i.mean().item(), similarity_j.mean().item())
+                        
+                # if self.wedge_pcp:
+            pi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, pi)
+            pi_tilde = self.safe_normalize(pi_tilde, dim=2)
+            pj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, pj)
+            pj_tilde = self.safe_normalize(pj_tilde, dim=2)
+            qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
+            qi_tilde = self.safe_normalize(qi_tilde, dim=2)
+            qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
+            qj_tilde = self.safe_normalize(qj_tilde, dim=2)
+                # else:
+                #     qi_tilde = qi
+                #     qj_tilde = qj
+
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
 
         exponent, gamma_i, gamma_j = self.get_gamma_exponent(dx, pi, pj, q_mean, idx, gamma)
         d_tilde = d * torch.exp(exponent)
-        # d_tilde = d
-        # print(torch.exp(exponent).mean().item(), torch.exp(exponent).max().item())
 
         # All the S-terms are calculated
-        S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
-        S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
-        S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
-
+        # S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle
+        # S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)      # Calculating S2 (The ABP-PCP part of S).
+        # S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                  # Calculating S3 (The PCP-position part of S)
+        S1 = (torch.sum(pi_tilde * pj_tilde, dim=2) + torch.linalg.norm(torch.cross(pi_tilde, dx, dim=2), dim=2) + torch.linalg.norm(torch.cross(pj_tilde, dx, dim=2), dim=2)) / 3.0
+        S2 = (torch.sum(qi_tilde * qj_tilde, dim=2) + torch.linalg.norm(torch.cross(qi_tilde, pi_tilde, dim=2), dim=2) + torch.linalg.norm(torch.cross(qj_tilde, pj_tilde, dim=2), dim=2)) / 3.0
+        S3 = (torch.linalg.norm(torch.cross(qi_tilde, dx, dim=2), dim=2) + torch.linalg.norm(torch.cross(qj_tilde, dx, dim=2), dim=2)) / 2.0
 
         # print('S1', S1)
         # print('\n')
@@ -704,6 +710,8 @@ class Simulation:
         # print('Angle between pi and pj:', (angle_pi_pj) / np.pi * 180)
         # print('Angle between qi and qj:', (angle_qi_qj) / np.pi * 180)
 
+        S1_original = S1.clone()  # Store original S1 for export
+        S2_original = S2.clone()  # Store original S2 for export
         S1 = self.rescale_s(S1)
         if self.nematic_pcp:
             S2 = torch.abs(S2)              # We take the absolute value of S2 as we only care about the strength of the interaction, not the direction. This is because we have already taken care of the directionality in the way we construct pi_tilde and pj_tilde
@@ -785,7 +793,65 @@ class Simulation:
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
-        return V , Vi
+        return V, Vi, S1_original, S2_original
+
+    def evaluate_V(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base):
+        """Evaluate total potential V and per-cell terms using a fixed neighbour index list."""
+        d, dx, idx, z_mask = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
+        return self.potential(
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, d, dx, idx, z_mask
+        )
+
+    def finite_diff_grad(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base):
+        """Central finite-difference gradients of V w.r.t. x, p, q (per cell, per coordinate)."""
+        h = self.fd_h
+        inv_2h = 1.0 / (2.0 * h)
+        n_cells = x.shape[0]
+
+        g_x = torch.zeros_like(x)
+        g_p = torch.zeros_like(p)
+        g_q = torch.zeros_like(q)
+
+        with torch.no_grad():
+            for i in range(n_cells):
+                for d in range(3):
+                    x_plus = x.clone()
+                    x_minus = x.clone()
+                    x_plus[i, d] += h
+                    x_minus[i, d] -= h
+                    v_plus, _, _, _ = self.evaluate_V(
+                        x_plus, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    v_minus, _, _, _ = self.evaluate_V(
+                        x_minus, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    g_x[i, d] = (v_plus - v_minus) * inv_2h
+
+                    p_plus = p.clone()
+                    p_minus = p.clone()
+                    p_plus[i, d] += h
+                    p_minus[i, d] -= h
+                    v_plus, _, _, _ = self.evaluate_V(
+                        x, p_plus, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    v_minus, _, _, _ = self.evaluate_V(
+                        x, p_minus, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    g_p[i, d] = (v_plus - v_minus) * inv_2h
+
+                    q_plus = q.clone()
+                    q_minus = q.clone()
+                    q_plus[i, d] += h
+                    q_minus[i, d] -= h
+                    v_plus, _, _, _ = self.evaluate_V(
+                        x, p, q_plus, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    v_minus, _, _, _ = self.evaluate_V(
+                        x, p, q_minus, p_mask, alpha_par, alpha_perp, gamma, idx_base
+                    )
+                    g_q[i, d] = (v_plus - v_minus) * inv_2h
+
+        return g_x, g_p, g_q
 
     def init_simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -812,12 +878,12 @@ class Simulation:
         assert len(q) == len(x)
 
         # Putting the data on the right device (GPU or CPU)
-        x = torch.tensor(x, requires_grad=True, dtype=self.dtype, device=self.device)
-        p = torch.tensor(p, requires_grad=True, dtype=self.dtype, device=self.device)
-        q = torch.tensor(q, requires_grad=True, dtype=self.dtype, device=self.device)
-        alpha_par = torch.tensor(alpha_par, requires_grad=True, dtype=self.dtype, device=self.device)
-        alpha_perp = torch.tensor(alpha_perp, requires_grad=True, dtype=self.dtype, device=self.device)
-        gamma = torch.tensor(gamma, requires_grad=True, dtype=self.dtype, device=self.device)
+        x = torch.tensor(x, dtype=self.dtype, device=self.device)
+        p = torch.tensor(p, dtype=self.dtype, device=self.device)
+        q = torch.tensor(q, dtype=self.dtype, device=self.device)
+        alpha_par = torch.tensor(alpha_par, dtype=self.dtype, device=self.device)
+        alpha_perp = torch.tensor(alpha_perp, dtype=self.dtype, device=self.device)
+        gamma = torch.tensor(gamma, dtype=self.dtype, device=self.device)
 
         p_mask = torch.tensor(p_mask, dtype=torch.int, device=self.device)
         self.beta   = torch.zeros(x.shape[0], dtype=self.dtype, device=self.device) # Initialization of beta tensor. Used for cell division.
@@ -881,6 +947,9 @@ class Simulation:
             p_mask (torch.Tensor or None): The updated particle mask.
         """
 
+        if self.tstep == 0:
+            print("Starting simulation (finite diff)")
+
         # Update proliferation rate from when we want cell proliferation to occur
         if tstep == (self.prolif_delay + 1) and self.prolif_rate is not None:
             if torch.unique(p_mask).shape[0] > 1:        # If we have multiple cell types
@@ -891,6 +960,7 @@ class Simulation:
 
         # Start with cell division
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
+        # self.apoptosis, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_apoptosis(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         # Advance any stateful boundary/stretch logic once per timestep (beginning-of-step).
         if self.tstep > 1_000:
@@ -899,110 +969,42 @@ class Simulation:
                 if not self.just_move_bool:
                     self.advance_stretch_state(x, p_mask)
 
-        # Refresh potential neighbours at most once per timestep (KDTree), then reuse idx for both stages.
+        # Refresh potential neighbours at most once per timestep (KDTree), then reuse idx for FD perturbations.
         self.refresh_potential_neighbours_once(x, self.k)
         idx_base = self.idx
 
-        # 
-        d1, dx1, idx1, z_mask1 = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
-        V1, Vi = self.potential(x, p, q, p_mask,
-                                alpha_par, alpha_perp, gamma,
-                                d1, dx1, idx1, z_mask1)
-
-        g1_x, g1_p, g1_q, g1_alpha_par, g1_alpha_perp, g1_gamma = torch.autograd.grad(
-            V1, (x, p, q, alpha_par, alpha_perp, gamma), create_graph=False, retain_graph=False
+        V_total, Vi, S1_yield, S2_yield = self.evaluate_V(
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
+        )
+        g_x, g_p, g_q = self.finite_diff_grad(
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, idx_base
         )
 
-        # Shared noise for additive-noise predictor/corrector
         with torch.no_grad():
             xi_x = torch.empty_like(x).normal_()
             # Rotational noise for p/q: random axis + small angle (eta is angular std dev in radians)
-            # we make axis_p and axis_q perpendicular to p and q respectively by taking a random vector and projecting out the parallel component, then normalizing. This ensures the noise is purely rotational and does not change the magnitude of p and q. 
-            
+            # we make axis_p and axis_q perpendicular to p and q respectively by taking a random vector and projecting out the parallel component, then normalizing. This ensures the noise is purely rotational and does not change the magnitude of p and q.
+
             xi_p = torch.empty_like(p).normal_()
             xi_p = xi_p - torch.sum(xi_p * p, dim=1, keepdim=True) * p
 
             xi_q = torch.empty_like(q).normal_()
             xi_q = xi_q - torch.sum(xi_q * q, dim=1, keepdim=True) * q
 
-            # Predictor state
-            x_tilde = x.clone()
-            p_tilde = p.clone()
-            q_tilde = q.clone()
-            alpha_par_tilde = alpha_par.clone()
-            alpha_perp_tilde = alpha_perp.clone()
-            gamma_tilde = gamma.clone()
-
             for i, eta in enumerate(self.eta_lst):
                 if not self.update_cells_bools[i]:
                     continue
                 mask = p_mask == i
 
-                polar_eta = self.polar_eta_lst[i]
+                x[mask] += (-g_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
+                p[mask] += (-g_p[mask] * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)
+                q[mask] += (-g_q[mask] * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
 
-                x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p_tilde[mask] += (-g1_p[mask] * self.dt) + (polar_eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the predictor, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
-                q_tilde[mask] += (-g1_q[mask] * self.dt) + (polar_eta * xi_q[mask] * self.sqrt_dt)
-
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt)    #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
-
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt)  #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
-
-                if self.gamma_bool_lst[i]:
-                    gamma_tilde[mask] += self.gamma_update_speed * (-g1_gamma[mask] * self.dt)
-
-            # Apply constraints before stage 2 drift evaluation
-            p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde = self.apply_constraints(
-                p_tilde, q_tilde, p_mask, alpha_par_tilde, alpha_perp_tilde, gamma_tilde
-            )
-
-        # Make predictor state leaf tensors for stage-2 grad evaluation
-        x_tilde.requires_grad_(True)
-        p_tilde.requires_grad_(True)
-        q_tilde.requires_grad_(True)
-        alpha_par_tilde.requires_grad_(True)
-        alpha_perp_tilde.requires_grad_(True)
-        gamma_tilde.requires_grad_(True)
-
-        # ------------------------
-        # Stage 2 (drift at X~)
-        # ------------------------
-        d2, dx2, idx2, z_mask2 = self.true_neighbours_from_idx(x_tilde, p_tilde, q_tilde, gamma_tilde, idx_base)
-        V2, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
-                               alpha_par_tilde, alpha_perp_tilde, gamma_tilde,
-                               d2, dx2, idx2, z_mask2)
-
-        g2_x, g2_p, g2_q, g2_alpha_par, g2_alpha_perp, g2_gamma = torch.autograd.grad(
-            V2, (x_tilde, p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde),
-            create_graph=False, retain_graph=False
-        )
-
-        # ------------------------
-        # Corrector (Heun)
-        # ------------------------
-        with torch.no_grad():
-            for i, eta in enumerate(self.eta_lst):
-                if not self.update_cells_bools[i]:
-                    continue
-                mask = p_mask == i
-
-                x[mask] += (-0.5 * (g1_x[mask] + g2_x[mask]) * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
-                p[mask] += (-0.5 * (g1_p[mask] + g2_p[mask]) * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the corrector, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
-                q[mask] += (-0.5 * (g1_q[mask] + g2_q[mask]) * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
-
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
-
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
-
-                if self.gamma_bool_lst[i]:
-                    gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt) #+ (eta * xi_gamma[mask] * self.sqrt_dt)
-
-            # Final constraints
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
+
+            xgrad_export = g_x.clone()
+            pgrad_export = g_p.clone()
+            qgrad_export = g_q.clone()
 
         with torch.no_grad():
             if self.just_move_bool and self.stretch_factor != 0.0:   # Just move the second cell type in x direction for stretching purposes. This is used for the control experiment where we want to see the effect of just moving the cells without any change in the potential.
@@ -1018,17 +1020,10 @@ class Simulation:
                     alpha_perp = alpha_perp[p_mask != 1]
                     p_mask = p_mask[p_mask != 1]
 
-                    x.requires_grad = True
-                    p.requires_grad = True
-                    q.requires_grad = True
-                    alpha_par.requires_grad = True
-                    alpha_perp.requires_grad = True
-                    gamma.requires_grad = True
-
                     self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
                     self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
 
-        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi  #Returning the goods.
+        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi, V_total, S1_yield, S2_yield, xgrad_export, pgrad_export, qgrad_export  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -1051,7 +1046,7 @@ class Simulation:
 
         tstep = 0
         while True:
-            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy, energy_total, S1_data, S2_data, xgrad_data, pgrad_data, qgrad_data = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
             
             tstep += 1
             self.tstep = tstep
@@ -1074,7 +1069,15 @@ class Simulation:
                 energy = energy.detach().to("cpu").numpy().copy()
                 pp_mask = p_mask.detach().to("cpu").numpy().copy()
                 
-                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy                                  # Yielding the data baybeeee
+                # Convert new data to numpy
+                Etot = energy_total.detach().to("cpu").numpy().copy() if isinstance(energy_total, torch.Tensor) else np.array([energy_total])
+                S1_array = S1_data.detach().to("cpu").numpy().copy()
+                S2_array = S2_data.detach().to("cpu").numpy().copy()
+                xgrad_array = xgrad_data.detach().to("cpu").numpy().copy()
+                pgrad_array = pgrad_data.detach().to("cpu").numpy().copy()
+                qgrad_array = qgrad_data.detach().to("cpu").numpy().copy()
+                
+                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy, Etot, S1_array, S2_array, xgrad_array, pgrad_array, qgrad_array                                  # Yielding the data baybeeee
     
     def cell_division(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -1147,13 +1150,6 @@ class Simulation:
                 alpha_perp = torch.cat((alpha_perp, alpha_perp0))
                 gamma = torch.cat((gamma, gamma0))
 
-        x.requires_grad = True
-        p.requires_grad = True
-        q.requires_grad = True
-        alpha_par.requires_grad = True
-        alpha_perp.requires_grad = True
-        gamma.requires_grad = True
-
         return division, x, p, q, p_mask, beta, alpha_par, alpha_perp, gamma      #Returning the goods.
 
     
@@ -1163,14 +1159,14 @@ def save(data_tuple, name, output_folder):
     Saves the simulation data to a pickle file with dict structure.
 
     Parameters:
-        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst)
+        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst)
         name (str): The name of the file (without extension).
         output_folder (str): The folder to save the file in.
 
     Returns:
         None, but saves the data
     """
-    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst = data_tuple
+    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst = data_tuple
 
     energy_lst_copy = energy_lst.copy()
     last_energy = np.zeros_like(p_mask_lst[-1])
@@ -1185,7 +1181,13 @@ def save(data_tuple, name, output_folder):
         'alpha_par': alpha_par_lst,
         'alpha_perp': alpha_perp_lst,
         'gamma': gamma_lst,
-        'energy': energy_lst_copy
+        'energy': energy_lst_copy,
+        'Etot': Etot_lst,
+        'S1': S1_lst,
+        'S2': S2_lst,
+        'xgrad': xgrad_lst,
+        'pgrad': pgrad_lst,
+        'qgrad': qgrad_lst
     }
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
@@ -1278,6 +1280,12 @@ def run_simulation(sim_dict):
     alpha_perp_lst = [alpha_perp * 180.0/np.pi]
     gamma_lst = [np.exp(gamma)]
     energy_lst = []
+    Etot_lst = []
+    S1_lst = []
+    S2_lst = []
+    xgrad_lst = []
+    pgrad_lst = []
+    qgrad_lst = []
 
     # we make an initial energy
 
@@ -1287,7 +1295,7 @@ def run_simulation(sim_dict):
         json.dump(sim_dict, f, indent = 2)
 
     # Save the initial simulation data
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)
 
     # Print the notes if verbose
     if verbose:
@@ -1299,7 +1307,7 @@ def run_simulation(sim_dict):
     t1 = time() # We timing stuff
 
     # Saving data at intervals specified by yield_every:
-    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy in itertools.islice(runner, yield_steps):
+    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy, Etot_data, S1_data, S2_data, xgrad_data, pgrad_data, qgrad_data in itertools.islice(runner, yield_steps):
         i += 1
         if verbose:
             print(f'Running {i} of {yield_steps}   ({yield_every * i} of {yield_every * yield_steps})   ({len(xx)} cells)', end='\r')
@@ -1312,19 +1320,25 @@ def run_simulation(sim_dict):
         alpha_perp_lst.append(alpha_perpperp)
         gamma_lst.append(gammagamma)
         energy_lst.append(energyenergy)
+        Etot_lst.append(Etot_data)
+        S1_lst.append(S1_data)
+        S2_lst.append(S2_data)
+        xgrad_lst.append(xgrad_data)
+        pgrad_lst.append(pgrad_data)
+        qgrad_lst.append(qgrad_data)
         
         if len(pp_mask) > sim_dict['max_cells']:
             break
         
         # Every 50 yield steps we dump the data
         if i % 50 == 0:
-            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)
     
     if verbose:
         print(f'Simulation done, saved {i} datapoints')
         print('Took', time() - t1, 'seconds')
 
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)  # Last iteration is saved
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, Etot_lst, S1_lst, S2_lst, xgrad_lst, pgrad_lst, qgrad_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
 def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
     """
@@ -1611,7 +1625,7 @@ def make_4cells_on_string(mask=None, alpha_params=None, gamma_params=None):
     p = np.array([[0,1,0], [0,1,0], [0,1,0], [0,1,0]])
     q = np.array([[0,0,1], [0,0,1], [0,0,1], [0,0,1]])
     if mask is None:
-        print('We doing mixed types')
+        # print('We doing mixed types')
         mask = np.array([1,0,1,0])                
 
     alpha_par = np.zeros(4)
@@ -1649,7 +1663,7 @@ def make_two_particles_on_string(q_dir,p_mask=None,alpha_params=None, gamma_para
     p = np.array([[0, 1, 0], [0, 1, 0]])
     q = np.zeros_like(p)
     q[:, q_dir] = 1
-    print(q)
+    # print(q)
     if p_mask is None:    
         mask = np.array([0, 0])  # Two different cell types for testing
     else:
@@ -1688,7 +1702,7 @@ def make_three_particles_on_string(q_dir,p_mask=None,alpha_params=None, gamma_pa
     p = np.array([[0, 1, 0], [0, 1, 0], [0, 1, 0]])
     q = np.zeros_like(p)
     q[:, q_dir] = 1
-    print(q)
+    # print(q)
     if p_mask is None:    
         mask = np.array([0, 0, 0])  # Two different cell types for testing
     else:

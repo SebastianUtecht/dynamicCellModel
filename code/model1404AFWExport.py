@@ -588,8 +588,8 @@ class Simulation:
         #creating an orthonormal basis
             q_axis = self.safe_normalize(q_mean, dim=2)
             p_axis = self.safe_normalize(p_mean, dim=2)
-            q_axis = q_axis - torch.sum(q_axis * p_axis, dim=2, keepdim=True) * p_axis
-            q_axis = self.safe_normalize(q_axis, dim=2)
+            # q_axis = q_axis - torch.sum(q_axis * p_axis, dim=2, keepdim=True) * p_axis
+            # q_axis = self.safe_normalize(q_axis, dim=2)
             perp_axis = torch.cross(q_axis, p_axis, dim=2)
             perp_axis = self.safe_normalize(perp_axis, dim=2)
 
@@ -645,12 +645,15 @@ class Simulation:
         #     similarity_j = torch.sum(pj_tilde_new * pj_tilde_old, dim=2) / (torch.linalg.norm(pj_tilde_new, dim=2) * torch.linalg.norm(pj_tilde_old, dim=2) + 1e-8)
         #     print('Similarity between rotation methods (should be close to 1):', similarity_i.mean().item(), similarity_j.mean().item())
                 
-        if self.wedge_pcp:
-            qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
-            qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
-        else:
-            qi_tilde = qi
-            qj_tilde = qj
+        # if self.wedge_pcp:
+        qi_tilde = torch.einsum('...ij,...j->...i', rot_mat_i, qi)
+        qi_tilde = self.safe_normalize(qi_tilde, dim=2)
+        qj_tilde = torch.einsum('...ij,...j->...i', rot_mat_j, qj)
+        qj_tilde = self.safe_normalize(qj_tilde, dim=2)
+        # else:
+        #     qi_tilde = qi
+        #     qj_tilde = qj
+
 
         with torch.no_grad():
             wall_mask = (torch.sum(pi * pj , dim = 2) <= 0.0)           #* (torch.sum(-dx * pj , dim = 2) < 0.0) #maybe comment in later
