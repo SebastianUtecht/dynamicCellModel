@@ -82,9 +82,9 @@ class Simulation:
 
         # Stretching parameters
         self.stretch_factor     = sim_dict['stretch_factor']        # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
-        self.stretch_time_stop = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
+        self.stretch_time_stop  = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
         self.stretch_bound_axis = sim_dict['stretch_bound_axis'] # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
-        
+        self.stretch_type       = sim_dict['stretch_type']       # The type of stretching to apply. Only relevant if stretch_factor is not 0
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
@@ -656,7 +656,8 @@ class Simulation:
 
         # We calculate the initial x_mass_midpoint for stretching purposes.
         with torch.no_grad():
-            self.x_mass_midpoint = torch.sum(x[:,0]) / x.shape[0]
+            self.mass_midpoint = torch.mean(x, dim=0)  # Calculate the mean position of all cells
+            self.x_mass_midpoint = self.mass_midpoint[0]  # Store the initial mean position for later use
 
         return x, p, q, p_mask, alpha_par, alpha_perp, gamma # Returning the goods.
     
@@ -835,8 +836,43 @@ class Simulation:
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         with torch.no_grad():
-            if self.stretch_factor != 0.0:   
-                x[:,self.stretch_bound_axis][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
+            if self.stretch_factor != 0.0:
+                if self.stretch_type == 'straight':
+                    x[:,self.stretch_bound_axis][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
+                elif self.stretch_type == 'curved':
+                    if self.tstep == 0:
+                        self.left_ones = (p_mask == 1) * (x[:,0] < self.x_mass_midpoint)
+                        self.right_ones = (p_mask == 1) * (x[:,0] >= self.x_mass_midpoint)
+                        self.down_stretch = False
+                    
+                    # We want the vectors pointing from each p_mask == 1 cells to the line constructed by the mass midpoint
+                    # and the stretch_bound_axis.
+                    if not(self.down_stretch):
+                        radii_left = x[self.left_ones] - self.mass_midpoint
+                        radii_left[:,self.stretch_bound_axis] = 0.0
+                        axis = torch.zeros_like(radii_left)
+                        axis[:,self.stretch_bound_axis] = 1.0
+                        direction_left = self.safe_normalize(torch.cross(radii_left, axis, dim=1), dim=1)
+                        radii_right = x[self.right_ones] - self.mass_midpoint
+                        radii_right[:,self.stretch_bound_axis] = 0.0
+                        axis = torch.zeros_like(radii_right)
+                        axis[:,self.stretch_bound_axis] = 1.0
+                        direction_right = self.safe_normalize(torch.cross(axis, radii_right, dim=1), dim=1)
+                        x[self.left_ones] += self.stretch_factor * self.dt * direction_left
+                        x[self.right_ones] += self.stretch_factor * self.dt * direction_right
+                        p[self.left_ones] = -direction_left
+                        p[self.right_ones] = -direction_right
+
+                        min_dist_left_right = x[self.left_ones][:,None] - x[self.right_ones][None,:]
+                        min_dist_left_right = torch.norm(min_dist_left_right, dim=2)
+                        min_dist = torch.min(min_dist_left_right)
+                        if min_dist < 2.1:
+                            self.down_stretch = True
+                    else:
+                        x[:,2][p_mask == 1] += - self.stretch_factor * self.dt #* torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
+                else:
+                    raise ValueError(f"Unknown stretch_type: {self.stretch_type}")
+
                 if self.tstep >= self.stretch_time_stop:
                     self.stretch_factor = 0.0
                     
@@ -1354,16 +1390,14 @@ def make_stretch_plain(N, stretch_frac, alpha_params=None, gamma_params=None):
 
     return plain_data
 
-def make_stretch_cylinder(N, stretch_frac, mirrored=True, radius=10, length=30, alpha_params=None, gamma_params=None):
+def make_stretch_rectangle(length, width, stretch_frac, alpha_params=None, gamma_params=None):
     """
-    Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
-
-    Parameters
-        N (int): The number of cells to generate.
+    Generates cells in the xy-plane with abp polarities pointing in the z-direction and randomly initialized pcp polarities.
+    N is a side so the total number of cells is N^2.
+    Cells are initially placed in a grid 2 units apart.
+    The stretch_frac works as in make_sphere_surface_stretch,
         stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
-        mirrored (bool): Whether to stretch to both sides or only 1.
-        radius (float): The radius of the cylinder.
-        length (float): The length of the cylinder.
+        size (float): The size of the plain.
 
     Returns
         tuple: A tuple containing the following elements:
@@ -1377,26 +1411,96 @@ def make_stretch_cylinder(N, stretch_frac, mirrored=True, radius=10, length=30, 
             - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
     """
 
-    # Generate random positions on a cylinder
-    theta = np.random.rand(N) * 2 * np.pi
-    z = np.random.rand(N) * length - length/2  # Random z values between -length/2 and length/2
-    x = np.zeros((N, 3))
-    x[:, 0] = radius * np.cos(theta)
-    x[:, 1] = radius * np.sin(theta)
-    x[:, 2] = z
+    # Generate grid positions in the xy-plane
+    x = np.array([[i*2, j*2, 0] for i in range(length) for j in range(width)], dtype=float)
+
+    # Generate apicobasal polarities pointing in the z-direction
+    p = np.array([[0, 0, 1] for _ in range(length * width)], dtype=float)
+
+    # Generate random planar cell polarities
+    q = np.array([[0, 1, 0] for _ in range(length * width)], dtype=float)
+    # q = np.random.randn(length * width, 3)
+    # q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+
+    # Generate cell types based on distance from the center
+    mask = np.zeros(length * width, dtype=int)
+    # All cells in the stretch_frace fraction of the radius from the center are type 1
+    # Sorting cells by their distance from the center
+    sorted_indices = np.argsort(x[:,0])  # Sort by x-coordinate
+
+    mask[sorted_indices[:int(length * width * stretch_frac/2)]] = 1
+    mask[sorted_indices[int(length * width * (1-stretch_frac/2)):]] = 1
+
+    alpha_par = np.zeros(length * width)
+    alpha_perp = np.zeros(length * width)
+    gamma = np.zeros(length * width)
+
+    # check for unique values in mask. If only one unique value, we can set mask to None and save some time later on.
+    if np.unique(mask).size > 1:
+        
+        assert isinstance(alpha_params[0], list),   "Expected alpha_params to be a list of lists for multiple cell types"
+        assert isinstance(gamma_params, list),      "Expected gamma_params to be a list for multiple cell types"
+
+        # Setting initial alpha values
+        alpha_par[mask == 0]    = alpha_params[0][0][0] * np.pi/180.0
+        alpha_perp[mask == 0]   = alpha_params[0][1][0] * np.pi/180.0
+        alpha_par[mask == 1]    = alpha_params[1][0][0] * np.pi/180.0
+        alpha_perp[mask == 1]   = alpha_params[1][1][0] * np.pi/180.0
+
+        # Setting initial gamma values
+        gamma[mask == 0]        = np.log(gamma_params[0][0])
+        gamma[mask == 1]       = np.log(gamma_params[1][0])
+    else:
+        alpha_par[:]    = alpha_params[0][0] * np.pi/180.0
+        alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
+        gamma[:]        = np.log(gamma_params[0])
+
+    plain_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+
+    return plain_data
+
+def make_stretch_cylinder(circumference, length, stretch_frac, mirrored=True, alpha_params=None, gamma_params=None):
+    """
+    Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
+
+    Parameters
+        circumference (int): The circumference of the cylinder in number of cells.
+        length (int): The length of the cylinder in number of cells.
+        stretch_frac (float): The fraction of cells that will be stretched. Same as make_sphere_surface_stretch
+        mirrored (bool): Whether to stretch to both sides or only 1.
+
+    Returns
+        tuple: A tuple containing the following elements:
+            - mask (np.ndarray): The mask indicating the type of each cell.
+            - x (np.ndarray): The positions of the cells.
+            - p (np.ndarray): The apicobasal polarities of the cells.
+            - q (np.ndarray): The planar cell polarities of the cells
+            - alpha_par (np.ndarray): The parallel alpha parameter for each cell.
+            - alpha_perp (np.ndarray): The perpendicular alpha parameter for each cell.
+            - gamma_par (np.ndarray): The parallel gamma (elongation) parameter for each cell.
+            - gamma_perp (np.ndarray): The perpendicular gamma (elongation) parameter for each cell.
+    """
+
+    # Generate positions on the surface of a cylinder
+    radius = (2.2 * circumference) / (2 * np.pi)
+    theta = np.linspace(0, 2 * np.pi, circumference, endpoint=False)
+    z = np.linspace(0, length*2, length, endpoint=False)
+    theta_grid, z_grid = np.meshgrid(theta, z)
+    x = np.zeros((length * circumference, 3))
+    x[:, 0] = radius * np.cos(theta_grid.flatten())
+    x[:, 1] = radius * np.sin(theta_grid.flatten())
+    x[:, 2] = z_grid.flatten()
 
     # Generate apicobasal polarities pointing radially outward
     p = np.zeros_like(x)
-    p[:, 0] = np.cos(theta)
-    p[:, 1] = np.sin(theta)
+    p[:, 0] = np.cos(theta_grid.flatten())
+    p[:, 1] = np.sin(theta_grid.flatten())
 
-    # Generate planar cell polarities pointing around the cylinder
+    # Generate planar cell polarities pointing along the cylinder
     q = np.zeros_like(x)
-    q[:, 0] = -np.sin(theta)
-    q[:, 1] = np.cos(theta)
-    q[:, 2] = 0
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
+    q[:, 2] = 1
 
+    N = (length * circumference)
     # Generate cell types based on distance from the center
     mask = np.zeros(N, dtype=int)
     # All cells in the stretch_frace fraction of the radius from the center are type 1
