@@ -43,6 +43,8 @@ class VoronoiAnimator:
         apply_occlusion: bool = False,
         start_ts: int = 0,
         end_ts: Optional[int] = None,
+        border_cap: Optional[float] = None,
+        enable_lateral_boundary: bool = True,
     ) -> bool:
         """
         Pre-compute Voronoi tessellations for a range of timesteps.
@@ -100,8 +102,13 @@ class VoronoiAnimator:
                 if x is None or len(x) == 0:
                     continue
 
-                # Compute Voronoi using augmented 3D approach
-                voronoi_comp = AugmentedVoronoi(x, p, thickness=2.0)
+                voronoi_comp = AugmentedVoronoi(
+                    x,
+                    p,
+                    thickness=2.0,
+                    border_cap=border_cap,
+                    enable_lateral_boundary=enable_lateral_boundary,
+                )
                 meshes_dict = voronoi_comp.compute_voronoi_meshes()
 
                 self.voronoi_meshes[t] = meshes_dict

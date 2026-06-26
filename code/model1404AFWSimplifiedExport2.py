@@ -457,6 +457,7 @@ class Simulation:
         Returns:
             V_sum (float): The total potential energy.
             Vij_normed (torch.Tensor): The potential energy between particles normalized by the number of interactions.
+            particle_defect_mask (torch.Tensor): Boolean mask of shape (N,) indicating cells involved in defect interactions.
         """
 
         if torch.unique(p_mask).shape[0] > 1:        # Check if p_mask is a tensor indicating 2 cell types. Otherwise it is None
@@ -543,8 +544,8 @@ class Simulation:
         d_tilde = d * torch.exp(exponent)
 
         # All the S-terms are calculated
-        S1 = torch.sum(pi_tilde * pj_tilde, dim=2) * torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2)                      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle 
-        S2 = torch.sum(qi_tilde * qj_tilde, dim=2) * torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2)          # Calculating S2 (The ABP-PCP part of S).
+        S1 = torch.sum(torch.cross(pj_tilde, dx, dim=2) * torch.cross(pi_tilde, dx, dim=2), dim=2) * torch.abs(torch.sum(pi_tilde * pj_tilde, dim=2))                      # Calculating S1 (The ABP-position part of S). Scalar for each particle-interaction. Meaning we get array of size (n, m) , m being the max number of nearest neighbors for a particle 
+        S2 = torch.sum(torch.cross(pi_tilde, qi_tilde, dim=2) * torch.cross(pj_tilde, qj_tilde, dim=2), dim=2) * torch.abs(torch.sum(qi_tilde * qj_tilde, dim=2))           # Calculating S2 (The ABP-PCP part of S).
         S3 = torch.sum(torch.cross(qi_tilde, dx, dim=2) * torch.cross(qj_tilde, dx, dim=2), dim=2)                                                              # Calculating S3 (The PCP-position part of S)
 
         S1 = self.rescale_s(S1)
@@ -560,11 +561,26 @@ class Simulation:
 
         Vij = z_mask.float() * S * (torch.exp(-d_tilde) - torch.exp(-d_tilde/5))        # Calculating the potential energy between particles masking out false interactions via voronoi_mask
         
+        particle_defect_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=self.device)
+
         if self.screen_out_defects:
 
             with torch.no_grad():
-                #TODO: EXPORT THE MASK SUCH THAT WE CAN SEE WHICH CELLS ARE AFFECTED
-                defect_mask = (torch.sum(qi * qj, dim=2) < 0.7) * z_mask  # Mask for defect interactions that are also true neighbors
+                seed_defect_mask = (torch.sum(qi_tilde * qj_tilde, dim=2) < 0.7) * z_mask  # Seed: low q-alignment interactions among true neighbors
+
+                if torch.any(seed_defect_mask):
+                    particle_defect_mask |= torch.any(seed_defect_mask, dim=1)
+                    particle_defect_mask[idx[seed_defect_mask]] = True
+
+                    # Include all interactions of seed-defect particles, not only low q-alignment pairs
+                    defect_mask = z_mask & (particle_defect_mask[:, None] | particle_defect_mask[idx])
+
+                    # Recompute per-particle mask from the expanded interaction mask
+                    particle_defect_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=self.device)
+                    particle_defect_mask |= torch.any(defect_mask, dim=1)
+                    particle_defect_mask[idx[defect_mask]] = True
+                else:
+                    defect_mask = torch.zeros_like(z_mask)
 
             if torch.any(defect_mask):
                 # Calculate S1 for defects using non-rotated vectors
@@ -573,7 +589,7 @@ class Simulation:
 
                 # Calculate the new S term for defects
                 # S_def = l[:,:,0] + (l[:,:,1] + l[:,:,2] + l[:,:,3]) * S1_def
-                S_def = 0.9 + 0.1 * S1_def
+                S_def = 0.5 + 0.5 * S1_def
 
                 # Calculate the potential for defects using non-elongated distance 'd'
                 Vij_def = z_mask.float() * S_def * (torch.exp(-d) - torch.exp(-d/5))
@@ -619,7 +635,7 @@ class Simulation:
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
-        return V , Vi
+        return V , Vi, particle_defect_mask
 
     def init_simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -738,9 +754,9 @@ class Simulation:
 
         # 
         d1, dx1, idx1, z_mask1 = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
-        V1, Vi = self.potential(x, p, q, p_mask,
-                                alpha_par, alpha_perp, gamma,
-                                d1, dx1, idx1, z_mask1)
+        V1, Vi, defect_mask = self.potential(x, p, q, p_mask,
+                                             alpha_par, alpha_perp, gamma,
+                                             d1, dx1, idx1, z_mask1)
 
         g1_x, g1_p, g1_q, g1_alpha_par, g1_alpha_perp, g1_gamma = torch.autograd.grad(
             V1, (x, p, q, alpha_par, alpha_perp, gamma), create_graph=False, retain_graph=False
@@ -803,9 +819,9 @@ class Simulation:
         # Stage 2 (drift at X~)
         # ------------------------
         d2, dx2, idx2, z_mask2 = self.true_neighbours_from_idx(x_tilde, p_tilde, q_tilde, gamma_tilde, idx_base)
-        V2, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
-                               alpha_par_tilde, alpha_perp_tilde, gamma_tilde,
-                               d2, dx2, idx2, z_mask2)
+        V2, _, _ = self.potential(x_tilde, p_tilde, q_tilde, p_mask,
+                                  alpha_par_tilde, alpha_perp_tilde, gamma_tilde,
+                                  d2, dx2, idx2, z_mask2)
 
         g2_x, g2_p, g2_q, g2_alpha_par, g2_alpha_perp, g2_gamma = torch.autograd.grad(
             V2, (x_tilde, p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde),
@@ -897,7 +913,7 @@ class Simulation:
                     self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
                     self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
 
-        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi  #Returning the goods.
+        return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi, defect_mask  #Returning the goods.
 
     def simulation(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -920,7 +936,7 @@ class Simulation:
 
         tstep = 0
         while True:
-            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
+            x, p, q, p_mask, alpha_par, alpha_perp, gamma, energy, defect_mask = self.time_step(x, p, q, p_mask, alpha_par, alpha_perp, gamma, tstep)        #Advancing the simulation one timestep
             
             tstep += 1
             self.tstep = tstep
@@ -942,8 +958,9 @@ class Simulation:
 
                 energy = energy.detach().to("cpu").numpy().copy()
                 pp_mask = p_mask.detach().to("cpu").numpy().copy()
+                defect_mask_out = defect_mask.detach().to("cpu").numpy().copy()
                 
-                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy                                  # Yielding the data baybeeee
+                yield xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energy, defect_mask_out                                  # Yielding the data baybeeee
     
     def cell_division(self, x, p, q, p_mask, alpha_par, alpha_perp, gamma):
         """
@@ -1030,18 +1047,22 @@ def save(data_tuple, name, output_folder):
     Saves the simulation data to a pickle file with dict structure.
 
     Parameters:
-        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst)
+        data_tuple (Tuple): (p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst)
         name (str): The name of the file (without extension).
         output_folder (str): The folder to save the file in.
 
     Returns:
         None, but saves the data
     """
-    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst = data_tuple
+    p_mask_lst, x_lst, p_lst, q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst = data_tuple
 
     energy_lst_copy = energy_lst.copy()
     last_energy = np.zeros_like(p_mask_lst[-1])
     energy_lst_copy.append(last_energy)
+
+    defect_mask_lst_copy = defect_mask_lst.copy()
+    last_defect_mask = np.zeros(p_mask_lst[-1].shape[0], dtype=bool)
+    defect_mask_lst_copy.append(last_defect_mask)
 
     # Structure: query by variable name to get list across all timeframes
     data_dict = {
@@ -1052,7 +1073,8 @@ def save(data_tuple, name, output_folder):
         'alpha_par': alpha_par_lst,
         'alpha_perp': alpha_perp_lst,
         'gamma': gamma_lst,
-        'energy': energy_lst_copy
+        'energy': energy_lst_copy,
+        'defect_mask': defect_mask_lst_copy
     }
     
     with open(f'{output_folder}/{name}.pkl', 'wb') as f:
@@ -1143,8 +1165,7 @@ def run_simulation(sim_dict):
     alpha_perp_lst = [alpha_perp * 180.0/np.pi]
     gamma_lst = [np.exp(gamma)]
     energy_lst = []
-
-    # we make an initial energy
+    defect_mask_lst = []
 
     # Save the simulation dictionary
     with open(output_folder + '/sim_dict.json', 'w') as f:
@@ -1152,7 +1173,7 @@ def run_simulation(sim_dict):
         json.dump(sim_dict, f, indent = 2)
 
     # Save the initial simulation data
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst), name='data', output_folder=output_folder)
 
     # Print the notes if verbose
     if verbose:
@@ -1164,7 +1185,7 @@ def run_simulation(sim_dict):
     t1 = time() # We timing stuff
 
     # Saving data at intervals specified by yield_every:
-    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy in itertools.islice(runner, yield_steps):
+    for xx, pp, qq, pp_mask, alpha_parpar, alpha_perpperp, gammagamma, energyenergy, defect_maskenergy in itertools.islice(runner, yield_steps):
         i += 1
         if verbose:
             print(f'Running {i} of {yield_steps}   ({yield_every * i} of {yield_every * yield_steps})   ({len(xx)} cells)', end='\r')
@@ -1177,19 +1198,20 @@ def run_simulation(sim_dict):
         alpha_perp_lst.append(alpha_perpperp)
         gamma_lst.append(gammagamma)
         energy_lst.append(energyenergy)
+        defect_mask_lst.append(defect_maskenergy)
         
         if len(pp_mask) > sim_dict['max_cells']:
             break
         
         # Every 50 yield steps we dump the data
         if i % 50 == 0:
-            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)
+            save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst), name='data', output_folder=output_folder)
     
     if verbose:
         print(f'Simulation done, saved {i} datapoints')
         print('Took', time() - t1, 'seconds')
 
-    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst), name='data', output_folder=output_folder)  # Last iteration is saved
+    save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
 def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
     """
@@ -1461,7 +1483,7 @@ def make_stretch_rectangle(length, width, stretch_frac, alpha_params=None, gamma
 
     return plain_data
 
-def make_stretch_cylinder(circumference, length, stretch_frac, mirrored=True, alpha_params=None, gamma_params=None):
+def make_stretch_cylinder(circumference, length, stretch_frac, polarity='par', mirrored=True, alpha_params=None, gamma_params=None):
     """
     Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
 
@@ -1499,8 +1521,16 @@ def make_stretch_cylinder(circumference, length, stretch_frac, mirrored=True, al
     p[:, 1] = np.sin(theta_grid.flatten())
 
     # Generate planar cell polarities pointing along the cylinder
-    q = np.zeros_like(x)
-    q[:, 2] = 1
+    if polarity == 'par':
+        q = np.zeros_like(x)
+        q[:, 2] = 1
+    elif polarity == 'perp':
+        q = np.zeros_like(x)
+        q[:, 0] = -np.sin(theta_grid.flatten())
+        q[:, 1] = np.cos(theta_grid.flatten())
+        q /= np.linalg.norm(q, axis=1)[:, None]
+    else:
+        raise ValueError("Polarity must be either 'par' or 'perp'.")
 
     N = (length * circumference)
     # Generate cell types based on distance from the center
