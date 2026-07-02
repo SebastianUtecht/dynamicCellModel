@@ -85,6 +85,8 @@ class Simulation:
         self.stretch_time_stop  = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
         self.stretch_bound_axis = sim_dict['stretch_bound_axis'] # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
         self.stretch_type       = sim_dict['stretch_type']       # The type of stretching to apply. Only relevant if stretch_factor is not 0
+        self.force_stretch      = sim_dict['force_stretch']       # Whether to force the stretch to be applied. Only relevant if stretch_factor is not 0
+        
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
@@ -762,6 +764,15 @@ class Simulation:
             V1, (x, p, q, alpha_par, alpha_perp, gamma), create_graph=False, retain_graph=False
         )
 
+        if (self.stretch_factor != 0.0 and self.force_stretch) and self.tstep > 1_000:
+            mask = (p_mask == 1)  # Only apply to the first cell type
+            # we subtract all of the x-gradient/force parallel to the stretch axis from the update:
+            stretch_bound_vec = torch.zeros_like(x[mask])
+            stretch_bound_vec[:, self.stretch_bound_axis] = 1.0
+
+            g1_x_parallel = torch.sum(g1_x[mask] * stretch_bound_vec, dim=1, keepdim=True) * stretch_bound_vec
+            g1_x[mask] -= g1_x_parallel 
+
         # Shared noise for additive-noise predictor/corrector
         with torch.no_grad():
             xi_x = torch.empty_like(x).normal_()
@@ -785,7 +796,7 @@ class Simulation:
             for i, eta in enumerate(self.eta_lst):
                 if not self.update_cells_bools[i]:
                     continue
-                mask = p_mask == i
+                mask = (p_mask == i)
 
                 polar_eta = self.polar_eta_lst[i]
 
@@ -828,6 +839,12 @@ class Simulation:
             create_graph=False, retain_graph=False
         )
 
+        if self.stretch_factor != 0.0 and self.force_stretch:
+            mask = (p_mask == 1)  # Only apply to the first cell type
+            # we subtract all of the x-gradient/force parallel to the stretch axis from the update:
+            g2_x_parallel = torch.sum(g2_x[mask] * stretch_bound_vec, dim=1, keepdim=True) * stretch_bound_vec
+            g2_x[mask] -= g2_x_parallel 
+
         # ------------------------
         # Corrector (Heun)
         # ------------------------
@@ -854,7 +871,7 @@ class Simulation:
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         with torch.no_grad():
-            if self.stretch_factor != 0.0:
+            if self.stretch_factor != 0.0 and self.tstep > 1_000:
                 if self.stretch_type == 'straight':
                     x[:,self.stretch_bound_axis][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
                 elif self.stretch_type == 'curved':

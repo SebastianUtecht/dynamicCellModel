@@ -7,13 +7,14 @@ camera, distance coloring, and layout helpers for multi-panel figures.
 
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
+from matplotlib.colors import ListedColormap, Normalize
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
-from matplotlib.patches import FancyArrowPatch
+from matplotlib.patches import Circle, FancyArrowPatch
 from scipy.spatial import cKDTree
 
 from voronoi_computation import AugmentedVoronoi, VoronoiMesh
@@ -42,7 +43,24 @@ RENDER_SETTINGS = {
     # backward-compatible aliases
     "edge_color": "#111111",
     "edge_width": 2.0,
+    "color_mode": "distance",  # "distance" | "scalar"
+    "scalar_key": "alpha_par",
+    "scalar_values": None,
+    "scalar_vmin": None,
+    "scalar_vmax": None,
 }
+
+_SCALAR_LOG_EPS = 1e-12
+_COLOR_START = np.array([0.0, 0.0, 0.3])
+_COLOR_MID = np.array([1.0, 0.2, 0.0])
+_COLOR_END = np.array([1.0, 1.0, 0.7])
+
+FIG3_ROW_LABELS = [
+    "Deformation type",
+    "Initial Configuration",
+    "During deformation",
+    "Post deformation",
+]
 
 
 def _merge_render_settings(
@@ -50,8 +68,8 @@ def _merge_render_settings(
     voronoi_edge_color=None,
     voronoi_edge_width=None,
 ):
-    """Merge optional Voronoi edge overrides into render_settings."""
-    settings = dict(render_settings or {})
+    """Merge render_settings with RENDER_SETTINGS defaults and optional edge overrides."""
+    settings = {**RENDER_SETTINGS, **(render_settings or {})}
     if voronoi_edge_color is not None:
         settings["voronoi_edge_color"] = voronoi_edge_color
         settings["edge_color"] = voronoi_edge_color
@@ -153,6 +171,112 @@ def _distance_colors(x, cam_pos, settings):
         norm = 1.0 - norm
 
     return plt.get_cmap(cmap_name)(norm)[:, :3]
+
+
+def _is_logspace_scalar(key: str) -> bool:
+    return isinstance(key, str) and "gamma" in key.lower()
+
+
+def _transform_scalar_values(key: str, values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if _is_logspace_scalar(key):
+        arr = np.log(np.clip(arr, _SCALAR_LOG_EPS, None))
+    return arr
+
+
+def _scalar_vcenter(key: str) -> Optional[float]:
+    if _is_logspace_scalar(key):
+        return 0.0
+    return None
+
+
+def scalar_to_rgba(
+    values: np.ndarray,
+    vmin: float,
+    vmax: float,
+    vcenter: Optional[float] = None,
+) -> np.ndarray:
+    """Map 1-D scalar array to RGBA using the GUI 3-point colormap."""
+    values = np.asarray(values, dtype=np.float32)
+    if vcenter is None:
+        vrange = vmax - vmin
+        if vrange > 0:
+            norm = np.clip((values - vmin) / vrange, 0.0, 1.0)
+        else:
+            norm = np.zeros_like(values)
+    else:
+        norm = np.full_like(values, 0.5, dtype=np.float32)
+        lo_mask = values <= vcenter
+        hi_mask = ~lo_mask
+        left = vcenter - vmin
+        right = vmax - vcenter
+        if left > 1e-12:
+            norm[lo_mask] = 0.5 * (values[lo_mask] - vmin) / left
+        else:
+            norm[lo_mask] = 0.5
+        if right > 1e-12:
+            norm[hi_mask] = 0.5 + 0.5 * (values[hi_mask] - vcenter) / right
+        else:
+            norm[hi_mask] = 0.5
+        norm = np.clip(norm, 0.0, 1.0)
+
+    colors = np.ones((len(values), 4), dtype=np.float32)
+    lo = norm < 0.5
+    t_lo = norm[lo] * 2.0
+    colors[lo, :3] = np.outer(1 - t_lo, _COLOR_START) + np.outer(t_lo, _COLOR_MID)
+    hi = ~lo
+    t_hi = (norm[hi] - 0.5) * 2.0
+    colors[hi, :3] = np.outer(1 - t_hi, _COLOR_MID) + np.outer(t_hi, _COLOR_END)
+    return colors
+
+
+def scalar_colors(
+    key: str, values: np.ndarray, vmin: float, vmax: float
+) -> np.ndarray:
+    """Map per-cell scalar values to RGB (matches data_visualization_gui_v2)."""
+    vals_t = _transform_scalar_values(key, values)
+    rgba = scalar_to_rgba(vals_t, vmin, vmax, _scalar_vcenter(key))
+    return rgba[:, :3]
+
+
+def compute_scalar_ranges(columns: List[dict]) -> Dict[str, Tuple[float, float]]:
+    """Shared vmin/vmax per scalar key across all fig3 panels."""
+    chunks: Dict[str, List[np.ndarray]] = {}
+    for col in columns:
+        scalar_key = col["scalar"]
+        data = col["data"]
+        for frame in col["frames"]:
+            vals = np.asarray(data[scalar_key][frame], dtype=np.float32)
+            chunks.setdefault(scalar_key, []).append(_transform_scalar_values(scalar_key, vals))
+
+    ranges: Dict[str, Tuple[float, float]] = {}
+    for key, parts in chunks.items():
+        all_vals = np.concatenate(parts)
+        if _is_logspace_scalar(key):
+            lo = min(float(np.min(all_vals)), 0.0)
+            hi = max(float(np.max(all_vals)), 0.0)
+        else:
+            lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
+        ranges[key] = (lo, hi)
+    return ranges
+
+
+def _cell_colors(x, cam_pos, settings):
+    """Per-cell RGB for Voronoi rendering (distance or scalar mode)."""
+    if settings.get("color_mode") == "scalar":
+        scalar_values = settings.get("scalar_values")
+        if scalar_values is None:
+            raise ValueError("color_mode='scalar' requires scalar_values in settings")
+        key = settings.get("scalar_key", "alpha_par")
+        vmin = settings.get("scalar_vmin")
+        vmax = settings.get("scalar_vmax")
+        vals_t = _transform_scalar_values(key, scalar_values)
+        if vmin is None:
+            vmin = float(vals_t.min())
+        if vmax is None:
+            vmax = float(vals_t.max())
+        return scalar_colors(key, scalar_values, vmin, vmax)
+    return _distance_colors(x, cam_pos, settings)
 
 
 def build_voronoi_meshes(x, p, settings=None) -> dict[int, VoronoiMesh]:
@@ -391,7 +515,7 @@ def render_voronoi_cluster(x, p, settings=None):
     cam_pos = _setup_camera(pl, center, settings)
     pl.clear()
 
-    base_colors = _distance_colors(x, cam_pos, settings)
+    base_colors = _cell_colors(x, cam_pos, settings)
     poly, face_colors = merge_voronoi_to_polydata(meshes, base_colors)
     if poly is None:
         raise RuntimeError("Failed to merge Voronoi meshes")
@@ -752,3 +876,270 @@ def plot_dual_basecase_comparison(
 
 # Backward-compatible aliases
 plot_radial_sphere_comparison = plot_radial_comparison
+
+
+def _schematic_arrow(ax, start, end, color="#333333", lw=1.6):
+    ax.add_patch(
+        FancyArrowPatch(
+            start,
+            end,
+            arrowstyle="-|>",
+            mutation_scale=12,
+            linewidth=lw,
+            color=color,
+            zorder=5,
+        )
+    )
+
+
+def _style_schematic_ax(ax):
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+
+def draw_deformation_schematic(ax, kind: str):
+    """
+    Draw a simple deformation schematic in ax.
+
+    kind: "curve" | "cylinder_sq" | "sphere_sq" | "sphere_pu"
+    """
+    _style_schematic_ax(ax)
+    outline = "#222222"
+
+    if kind == "curve":
+        y_top = 0.84
+        x_left, x_right = 0.10, 0.90
+        meet = (0.50, 0.36)
+        ax.plot([x_left, x_right], [y_top, y_top], color=outline, linewidth=2.2, zorder=2)
+        ax.add_patch(
+            FancyArrowPatch(
+                (x_left, y_top),
+                meet,
+                connectionstyle="arc3,rad=-0.55",
+                arrowstyle="-|>",
+                mutation_scale=12,
+                linewidth=1.6,
+                color="#333333",
+                zorder=5,
+            )
+        )
+        ax.add_patch(
+            FancyArrowPatch(
+                (x_right, y_top),
+                meet,
+                connectionstyle="arc3,rad=0.55",
+                arrowstyle="-|>",
+                mutation_scale=12,
+                linewidth=1.6,
+                color="#333333",
+                zorder=5,
+            )
+        )
+        _schematic_arrow(ax, meet, (meet[0], 0.10))
+
+    elif kind == "cylinder_sq":
+        xl, xr = 0.36, 0.64
+        y_bot, y_top = 0.24, 0.76
+        ax.plot([xl, xl], [y_bot, y_top], color=outline, linewidth=2.0, zorder=2)
+        ax.plot([xr, xr], [y_bot, y_top], color=outline, linewidth=2.0, zorder=2)
+        theta = np.linspace(np.pi, 2 * np.pi, 36)
+        cx = 0.50
+        rx = (xr - xl) / 2
+        ax.plot(
+            cx + rx * np.cos(theta),
+            y_bot + rx * 0.55 * np.sin(theta),
+            color=outline,
+            linewidth=2.0,
+            zorder=2,
+        )
+        ax.plot([0.10, 0.90], [0.90, 0.90], color=outline, linewidth=2.0, zorder=3)
+        ax.plot([0.10, 0.90], [0.10, 0.10], color=outline, linewidth=2.0, zorder=3)
+        _schematic_arrow(ax, (0.50, 0.90), (0.50, 0.78))
+        _schematic_arrow(ax, (0.50, 0.10), (0.50, 0.22))
+
+    elif kind == "sphere_sq":
+        fill = "#e8e8e8"
+        ax.add_patch(
+            Circle(
+                (0.50, 0.50),
+                0.28,
+                facecolor=fill,
+                edgecolor=outline,
+                linewidth=1.8,
+                zorder=1,
+            )
+        )
+        ax.plot([0.08, 0.08], [0.18, 0.82], color=outline, linewidth=2.0, zorder=2)
+        ax.plot([0.92, 0.92], [0.18, 0.82], color=outline, linewidth=2.0, zorder=2)
+        _schematic_arrow(ax, (0.10, 0.50), (0.20, 0.50))
+        _schematic_arrow(ax, (0.90, 0.50), (0.80, 0.50))
+
+    elif kind == "sphere_pu":
+        fill = "#e8e8e8"
+        ax.add_patch(
+            Circle(
+                (0.50, 0.50),
+                0.28,
+                facecolor=fill,
+                edgecolor=outline,
+                linewidth=1.8,
+                zorder=1,
+            )
+        )
+        _schematic_arrow(ax, (0.42, 0.50), (0.10, 0.50))
+        _schematic_arrow(ax, (0.58, 0.50), (0.90, 0.50))
+
+    else:
+        raise ValueError(
+            f"kind must be 'curve', 'cylinder_sq', 'sphere_sq', or 'sphere_pu', got {kind!r}"
+        )
+
+
+def _scalar_listed_colormap() -> ListedColormap:
+    n = 256
+    vals = np.linspace(0.0, 1.0, n)
+    rgba = scalar_to_rgba(vals, 0.0, 1.0, None)
+    return ListedColormap(rgba[:, :3])
+
+
+def _draw_scalar_colorbar(
+    fig, gs_slot, vmin: float, vmax: float, label: str = r"$\alpha$ (°)"
+):
+    ax = fig.add_subplot(gs_slot)
+    cmap = _scalar_listed_colormap()
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cb = fig.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=ax,
+        orientation="vertical",
+    )
+    cb.set_label(label, fontsize=10)
+    cb.ax.tick_params(labelsize=8)
+
+
+def plot_deformation_comparison(
+    columns,
+    render_settings=None,
+    output_path=None,
+    figsize=(15, 11),
+    voronoi_edge_color=None,
+    voronoi_edge_width=None,
+    scalar_vmin: float = -60.0,
+    scalar_vmax: float = 60.0,
+    panel_window_size: Tuple[int, int] = (560, 560),
+):
+    """
+    Figure 3: 4x4 grid of deformation schematics and scalar-colored Voronoi panels.
+
+    Each entry in `columns` must provide:
+        key        : deformation id ("curve", "cylinder_sq", "sphere_sq", "sphere_pu")
+        scalar     : "alpha_par" or "alpha_perp"
+        frames     : [initial_idx, during_idx, post_idx]
+        rotation   : optional {"axis": "x", "degrees": 90}
+        data       : loaded pkl dict with x, p, alpha_par, alpha_perp lists
+    """
+    if len(columns) != 4:
+        raise ValueError(f"Expected 4 columns, got {len(columns)}")
+
+    base_render = _merge_render_settings(
+        render_settings, voronoi_edge_color, voronoi_edge_width
+    )
+    base_render["window_size"] = panel_window_size
+    vmin, vmax = float(scalar_vmin), float(scalar_vmax)
+
+    rendered = [[None] * 4 for _ in range(4)]
+    for col_idx, col in enumerate(columns):
+        kind = col["key"]
+        scalar_key = col["scalar"]
+        rotation = col.get("rotation")
+        data = col["data"]
+        frames = col["frames"]
+        if len(frames) != 3:
+            raise ValueError(f"Column {kind!r} must have exactly 3 frame indices")
+
+        for row_idx, frame in enumerate(frames, start=1):
+            panel_settings = {
+                **base_render,
+                "color_mode": "scalar",
+                "scalar_key": scalar_key,
+                "scalar_values": np.asarray(data[scalar_key][frame], dtype=np.float32),
+                "scalar_vmin": vmin,
+                "scalar_vmax": vmax,
+            }
+            if rotation:
+                panel_settings["rotation"] = rotation
+            rendered[row_idx][col_idx] = render_voronoi_cluster(
+                data["x"][frame],
+                data["p"][frame],
+                settings=panel_settings,
+            )
+
+    width_ratios = [0.20, 0.85, 1.15, 1.15, 1.15, 1.15, 0.16]
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(
+        4,
+        7,
+        width_ratios=width_ratios,
+        wspace=0.04,
+        hspace=0.04,
+    )
+    fig.patch.set_facecolor("white")
+
+    ax_time = fig.add_subplot(gs[1:4, 0])
+    ax_time.set_xlim(0, 1)
+    ax_time.set_ylim(0, 1)
+    ax_time.axis("off")
+    ax_time.add_patch(
+        FancyArrowPatch(
+            (0.55, 0.92),
+            (0.55, 0.08),
+            arrowstyle="-|>",
+            mutation_scale=18,
+            linewidth=2.0,
+            color="#333333",
+            zorder=2,
+        )
+    )
+    ax_time.text(
+        0.08,
+        0.50,
+        "Time",
+        rotation=90,
+        va="center",
+        ha="center",
+        fontsize=12,
+        color="#333333",
+    )
+
+    for row_idx, label in enumerate(FIG3_ROW_LABELS):
+        ax_lbl = fig.add_subplot(gs[row_idx, 1])
+        ax_lbl.set_xlim(0, 1)
+        ax_lbl.set_ylim(0, 1)
+        ax_lbl.axis("off")
+        ax_lbl.text(
+            1.0,
+            0.50,
+            label,
+            ha="right",
+            va="center",
+            fontsize=10,
+            wrap=True,
+        )
+
+        for col_idx, col in enumerate(columns):
+            ax = fig.add_subplot(gs[row_idx, col_idx + 2])
+            ax.set_aspect("equal")
+            ax.axis("off")
+            if row_idx == 0:
+                draw_deformation_schematic(ax, col["key"])
+            else:
+                ax.imshow(rendered[row_idx][col_idx], aspect="equal")
+
+    _draw_scalar_colorbar(fig, gs[1:4, 6], vmin, vmax)
+
+    if output_path:
+        fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.08)
+
+    return fig
