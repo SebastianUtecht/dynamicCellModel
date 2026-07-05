@@ -619,8 +619,15 @@ class Simulation:
         Vij_sum = torch.sum(Vij)
 
         if self.gamma_diff_penalty:
+            # If p_mask == 1 cells are not updated we don't count them for the 
+            # gamma penalty
+
+            if not(self.update_cells_bools[1]):
+                masked_out_cells = torch.logical_or((interaction_mask == 2) , (interaction_mask == 1)) * (~z_mask)
+            else:
+                masked_out_cells = ~z_mask
             gamma_diff = (gamma_i - gamma_j)**2
-            gamma_diff[~z_mask] = 0.0
+            gamma_diff[masked_out_cells] = 0.0
             gamma_diff_sum = torch.sum(gamma_diff)
             Vij_sum += gamma_diff_sum * self.gamma_diff_penalty
 
