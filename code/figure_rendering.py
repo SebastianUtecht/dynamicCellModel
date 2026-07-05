@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import pyvista as pv
 from matplotlib.colors import ListedColormap, Normalize
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
-from matplotlib.patches import Circle, FancyArrowPatch
+from matplotlib.patches import Circle, Ellipse, FancyArrowPatch
 from scipy.spatial import cKDTree
 
 from voronoi_computation import AugmentedVoronoi, VoronoiMesh
@@ -907,20 +907,32 @@ def draw_deformation_schematic(ax, kind: str):
     """
     _style_schematic_ax(ax)
     outline = "#222222"
+    fill = "#f0f0f0"
 
     if kind == "curve":
-        y_top = 0.84
-        x_left, x_right = 0.10, 0.90
-        meet = (0.50, 0.36)
-        ax.plot([x_left, x_right], [y_top, y_top], color=outline, linewidth=2.2, zorder=2)
+        y_top = 0.86
+        x_left, x_right = 0.12, 0.88
+        meet_y = 0.40
+        cx = 0.50
+        radius = 0.38
+        theta = np.linspace(0.0, np.pi, 64)
+        ax.plot(
+            cx + radius * np.cos(theta),
+            y_top - radius * np.sin(theta),
+            color=outline,
+            linewidth=1.8,
+            zorder=2,
+        )
+        ax.plot([x_left, x_right], [y_top, y_top], color=outline, linewidth=2.0, zorder=3)
+        meet = (cx, meet_y)
         ax.add_patch(
             FancyArrowPatch(
                 (x_left, y_top),
                 meet,
-                connectionstyle="arc3,rad=-0.55",
+                connectionstyle="arc3,rad=-0.5",
                 arrowstyle="-|>",
-                mutation_scale=12,
-                linewidth=1.6,
+                mutation_scale=11,
+                linewidth=1.5,
                 color="#333333",
                 zorder=5,
             )
@@ -929,67 +941,69 @@ def draw_deformation_schematic(ax, kind: str):
             FancyArrowPatch(
                 (x_right, y_top),
                 meet,
-                connectionstyle="arc3,rad=0.55",
+                connectionstyle="arc3,rad=0.5",
                 arrowstyle="-|>",
-                mutation_scale=12,
-                linewidth=1.6,
+                mutation_scale=11,
+                linewidth=1.5,
                 color="#333333",
                 zorder=5,
             )
         )
-        _schematic_arrow(ax, meet, (meet[0], 0.10))
+        _schematic_arrow(ax, (0.46, meet_y - 0.04), (0.46, 0.12))
+        _schematic_arrow(ax, (0.54, meet_y - 0.04), (0.54, 0.12))
 
     elif kind == "cylinder_sq":
-        xl, xr = 0.36, 0.64
-        y_bot, y_top = 0.24, 0.76
-        ax.plot([xl, xl], [y_bot, y_top], color=outline, linewidth=2.0, zorder=2)
-        ax.plot([xr, xr], [y_bot, y_top], color=outline, linewidth=2.0, zorder=2)
-        theta = np.linspace(np.pi, 2 * np.pi, 36)
-        cx = 0.50
-        rx = (xr - xl) / 2
-        ax.plot(
-            cx + rx * np.cos(theta),
-            y_bot + rx * 0.55 * np.sin(theta),
-            color=outline,
-            linewidth=2.0,
-            zorder=2,
+        y_lo, y_hi = 0.16, 0.84
+        ax.plot([0.10, 0.10], [y_lo, y_hi], color=outline, linewidth=2.0, zorder=2)
+        ax.plot([0.90, 0.90], [y_lo, y_hi], color=outline, linewidth=2.0, zorder=2)
+        xl, xr = 0.43, 0.57
+        y_open = 0.30
+        y_cap = 0.52
+        ax.plot([xl, xl], [y_cap, y_hi], color=outline, linewidth=2.0, zorder=3)
+        ax.plot([xr, xr], [y_cap, y_hi], color=outline, linewidth=2.0, zorder=3)
+        ax.add_patch(
+            Ellipse(
+                (0.50, y_open),
+                xr - xl + 0.04,
+                0.14,
+                fill=False,
+                edgecolor=outline,
+                linewidth=1.8,
+                zorder=3,
+            )
         )
-        ax.plot([0.10, 0.90], [0.90, 0.90], color=outline, linewidth=2.0, zorder=3)
-        ax.plot([0.10, 0.90], [0.10, 0.10], color=outline, linewidth=2.0, zorder=3)
-        _schematic_arrow(ax, (0.50, 0.90), (0.50, 0.78))
-        _schematic_arrow(ax, (0.50, 0.10), (0.50, 0.22))
+        _schematic_arrow(ax, (0.12, 0.50), (0.38, 0.50))
+        _schematic_arrow(ax, (0.88, 0.50), (0.62, 0.50))
 
     elif kind == "sphere_sq":
-        fill = "#e8e8e8"
         ax.add_patch(
             Circle(
                 (0.50, 0.50),
-                0.28,
+                0.26,
                 facecolor=fill,
                 edgecolor=outline,
                 linewidth=1.8,
                 zorder=1,
             )
         )
-        ax.plot([0.08, 0.08], [0.18, 0.82], color=outline, linewidth=2.0, zorder=2)
-        ax.plot([0.92, 0.92], [0.18, 0.82], color=outline, linewidth=2.0, zorder=2)
-        _schematic_arrow(ax, (0.10, 0.50), (0.20, 0.50))
-        _schematic_arrow(ax, (0.90, 0.50), (0.80, 0.50))
+        ax.plot([0.08, 0.08], [0.16, 0.84], color=outline, linewidth=2.0, zorder=2)
+        ax.plot([0.92, 0.92], [0.16, 0.84], color=outline, linewidth=2.0, zorder=2)
+        _schematic_arrow(ax, (0.10, 0.50), (0.22, 0.50))
+        _schematic_arrow(ax, (0.90, 0.50), (0.78, 0.50))
 
     elif kind == "sphere_pu":
-        fill = "#e8e8e8"
         ax.add_patch(
             Circle(
                 (0.50, 0.50),
-                0.28,
+                0.26,
                 facecolor=fill,
                 edgecolor=outline,
                 linewidth=1.8,
                 zorder=1,
             )
         )
-        _schematic_arrow(ax, (0.42, 0.50), (0.10, 0.50))
-        _schematic_arrow(ax, (0.58, 0.50), (0.90, 0.50))
+        _schematic_arrow(ax, (0.50, 0.76), (0.50, 0.92))
+        _schematic_arrow(ax, (0.50, 0.24), (0.50, 0.08))
 
     else:
         raise ValueError(
@@ -1023,12 +1037,12 @@ def plot_deformation_comparison(
     columns,
     render_settings=None,
     output_path=None,
-    figsize=(15, 11),
+    figsize=(16, 10),
     voronoi_edge_color=None,
     voronoi_edge_width=None,
     scalar_vmin: float = -60.0,
     scalar_vmax: float = 60.0,
-    panel_window_size: Tuple[int, int] = (560, 560),
+    panel_window_size: Tuple[int, int] = (720, 720),
 ):
     """
     Figure 3: 4x4 grid of deformation schematics and scalar-colored Voronoi panels.
@@ -1047,6 +1061,8 @@ def plot_deformation_comparison(
         render_settings, voronoi_edge_color, voronoi_edge_width
     )
     base_render["window_size"] = panel_window_size
+    if "zoom_margin" not in (render_settings or {}):
+        base_render["zoom_margin"] = 0.06
     vmin, vmax = float(scalar_vmin), float(scalar_vmax)
 
     rendered = [[None] * 4 for _ in range(4)]
@@ -1076,14 +1092,16 @@ def plot_deformation_comparison(
                 settings=panel_settings,
             )
 
-    width_ratios = [0.20, 0.85, 1.15, 1.15, 1.15, 1.15, 0.16]
+    width_ratios = [0.10, 0.78, 1.28, 1.28, 1.28, 1.28, 0.12]
+    height_ratios = [0.62, 1.12, 1.12, 1.12]
     fig = plt.figure(figsize=figsize)
     gs = fig.add_gridspec(
         4,
         7,
         width_ratios=width_ratios,
-        wspace=0.04,
-        hspace=0.04,
+        height_ratios=height_ratios,
+        wspace=0.015,
+        hspace=0.015,
     )
     fig.patch.set_facecolor("white")
 
@@ -1119,19 +1137,19 @@ def plot_deformation_comparison(
         ax_lbl.set_ylim(0, 1)
         ax_lbl.axis("off")
         ax_lbl.text(
-            1.0,
+            0.0,
             0.50,
             label,
-            ha="right",
+            ha="left",
             va="center",
-            fontsize=10,
-            wrap=True,
+            fontsize=9.5,
         )
 
         for col_idx, col in enumerate(columns):
             ax = fig.add_subplot(gs[row_idx, col_idx + 2])
             ax.set_aspect("equal")
             ax.axis("off")
+            ax.margins(0)
             if row_idx == 0:
                 draw_deformation_schematic(ax, col["key"])
             else:
@@ -1140,6 +1158,6 @@ def plot_deformation_comparison(
     _draw_scalar_colorbar(fig, gs[1:4, 6], vmin, vmax)
 
     if output_path:
-        fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.08)
+        fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.03)
 
     return fig
