@@ -7,6 +7,8 @@ camera, distance coloring, and layout helpers for multi-panel figures.
 
 from __future__ import annotations
 
+from io import BytesIO
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -899,7 +901,55 @@ def _style_schematic_ax(ax):
     ax.axis("off")
 
 
-def draw_deformation_schematic(ax, kind: str):
+def load_svg_as_array(svg_path, dpi: int = 200) -> np.ndarray:
+    """Rasterize an SVG file to an RGBA numpy array for matplotlib imshow."""
+    path = Path(svg_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    try:
+        import cairosvg
+    except ImportError as exc:
+        raise ImportError(
+            "SVG schematics require cairosvg (pip install cairosvg)"
+        ) from exc
+    png_bytes = cairosvg.svg2png(url=str(path.resolve()), dpi=dpi)
+    return plt.imread(BytesIO(png_bytes), format="png")
+
+
+def _resolve_schematic_svgs(
+    columns: List[dict], schematic_svgs: Optional[List[str]] = None
+) -> List[Optional[str]]:
+    """Per-column SVG paths from schematic_svgs list or column['schematic_svg']."""
+    if schematic_svgs is not None:
+        if len(schematic_svgs) != len(columns):
+            raise ValueError(
+                f"schematic_svgs length {len(schematic_svgs)} must match "
+                f"columns length {len(columns)}"
+            )
+        return list(schematic_svgs)
+    return [col.get("schematic_svg") for col in columns]
+
+
+def _show_schematic_on_ax(ax, img: np.ndarray, scale: float = 1.0):
+    """Display a schematic image scaled by `scale` (>1 grows it, overflowing the cell)."""
+    scale = max(float(scale), 0.1)
+    half = 0.5 * scale
+    im = ax.imshow(
+        img,
+        extent=(0.5 - half, 0.5 + half, 0.5 - half, 0.5 + half),
+        aspect="equal",
+        origin="upper",
+    )
+    # Let the image grow past the axes bounds instead of being clipped by them.
+    im.set_clip_on(False)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.margins(0)
+
+
+def draw_deformation_schematic(ax, kind: str, scale: float = 1.0):
     """
     Draw a simple deformation schematic in ax.
 
@@ -1009,6 +1059,14 @@ def draw_deformation_schematic(ax, kind: str):
         raise ValueError(
             f"kind must be 'curve', 'cylinder_sq', 'sphere_sq', or 'sphere_pu', got {kind!r}"
         )
+    if scale != 1.0:
+        # Grow the drawing past the axes bounds (no clipping) instead of zooming
+        # the view window, which would crop the illustration at the cell edges.
+        for artist in list(ax.patches) + list(ax.lines):
+            artist.set_clip_on(False)
+        half = 0.5 / max(float(scale), 0.1)
+        ax.set_xlim(0.5 - half, 0.5 + half)
+        ax.set_ylim(0.5 - half, 0.5 + half)
 
 
 def _scalar_listed_colormap() -> ListedColormap:
@@ -1043,6 +1101,9 @@ def plot_deformation_comparison(
     scalar_vmin: float = -60.0,
     scalar_vmax: float = 60.0,
     panel_window_size: Tuple[int, int] = (720, 720),
+    schematic_svgs: Optional[List[str]] = None,
+    schematic_dpi: int = 200,
+    schematic_scale: float = 1.0,
 ):
     """
     Figure 3: 4x4 grid of deformation schematics and scalar-colored Voronoi panels.
@@ -1053,6 +1114,12 @@ def plot_deformation_comparison(
         frames     : [initial_idx, during_idx, post_idx]
         rotation   : optional {"axis": "x", "degrees": 90}
         data       : loaded pkl dict with x, p, alpha_par, alpha_perp lists
+        schematic_svg : optional per-column SVG path (overridden by schematic_svgs)
+        schematic_scale : optional per-column zoom for row-0 illustration
+
+    schematic_svgs : optional list of 4 SVG paths for row-0 deformation illustrations.
+    schematic_scale : zoom factor for deformation-type row (>1 = larger, default 1.0).
+    schematic_dpi  : rasterization DPI for SVGs (auto-boosted when scale > 1).
     """
     if len(columns) != 4:
         raise ValueError(f"Expected 4 columns, got {len(columns)}")
@@ -1064,6 +1131,15 @@ def plot_deformation_comparison(
     if "zoom_margin" not in (render_settings or {}):
         base_render["zoom_margin"] = 0.06
     vmin, vmax = float(scalar_vmin), float(scalar_vmax)
+    svg_paths = _resolve_schematic_svgs(columns, schematic_svgs)
+    schematic_images = []
+    for col_idx, path in enumerate(svg_paths):
+        if not path:
+            schematic_images.append(None)
+            continue
+        col_scale = columns[col_idx].get("schematic_scale", schematic_scale)
+        load_dpi = int(schematic_dpi * max(1.0, float(col_scale)))
+        schematic_images.append(load_svg_as_array(path, dpi=load_dpi))
 
     rendered = [[None] * 4 for _ in range(4)]
     for col_idx, col in enumerate(columns):
@@ -1151,7 +1227,12 @@ def plot_deformation_comparison(
             ax.axis("off")
             ax.margins(0)
             if row_idx == 0:
-                draw_deformation_schematic(ax, col["key"])
+                col_scale = col.get("schematic_scale", schematic_scale)
+                schematic_img = schematic_images[col_idx]
+                if schematic_img is not None:
+                    _show_schematic_on_ax(ax, schematic_img, scale=col_scale)
+                else:
+                    draw_deformation_schematic(ax, col["key"], scale=col_scale)
             else:
                 ax.imshow(rendered[row_idx][col_idx], aspect="equal")
 
