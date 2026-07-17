@@ -1,0 +1,104 @@
+{
+  "output_folder": "30_06_TESTS/pull_sphere_eta0.05_stretch0.03_wstop",
+  "yield_every": 50,
+  "yield_steps": 2000,
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "random_seed": 50,
+  "k": 18,
+  "prolif_rate": [
+    0.0,
+    0.0
+  ],
+  "prolif_delay": 0,
+  "max_cells": 20000,
+  "lambdas": [
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ],
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ],
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ]
+  ],
+  "etas": [
+    0.05,
+    0.05
+  ],
+  "polar_etas": [
+    0.05,
+    0.05
+  ],
+  "alpha_params": [
+    [
+      [
+        0,
+        "free"
+      ],
+      [
+        0,
+        "free"
+      ]
+    ],
+    [
+      [
+        0,
+        "free"
+      ],
+      [
+        0,
+        "free"
+      ]
+    ]
+  ],
+  "alpha_range": 60.0,
+  "gamma_params": [
+    [
+      1.0,
+      "locked"
+    ],
+    [
+      1.0,
+      "locked"
+    ]
+  ],
+  "gamma_range": 2.0,
+  "cell_wall_interaction": 0.0,
+  "dt": 0.2,
+  "nematic_pcp": false,
+  "update_cells_bools": [
+    true,
+    true
+  ],
+  "wedge_pcp": true,
+  "bound_type": null,
+  "bound_extents": [
+    24,
+    8
+  ],
+  "bound_move_times": [
+    2000,
+    5000
+  ],
+  "bound_continuity": 1000,
+  "stretch_bound_axis": 0,
+  "stretch_type": "straight",
+  "force_stretch": false,
+  "stretch_factor": 0.03,
+  "stretch_time_stop": 50000,
+  "gamma_diff_penalty": 0.0,
+  "gamma_update_speed": 1.0,
+  "screen_out_defects": false,
+  "notes": "pull_sphere_eta0.05_stretch0.03_wstop"
+}

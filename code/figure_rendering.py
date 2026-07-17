@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
-from matplotlib.colors import ListedColormap, Normalize
+from matplotlib.colors import ListedColormap, Normalize, TwoSlopeNorm
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 from matplotlib.patches import Circle, Ellipse, FancyArrowPatch
 from scipy.spatial import cKDTree
@@ -190,6 +190,17 @@ def _scalar_vcenter(key: str) -> Optional[float]:
     if _is_logspace_scalar(key):
         return 0.0
     return None
+
+
+def _scalar_norm_bounds(key: str, vmin: float, vmax: float) -> Tuple[float, float]:
+    """Convert user-facing scalar bounds to normalization space (log for gamma)."""
+    if _is_logspace_scalar(key):
+        lo = float(np.log(np.clip(vmin, _SCALAR_LOG_EPS, None)))
+        hi = float(np.log(np.clip(vmax, _SCALAR_LOG_EPS, None)))
+        lo = min(lo, 0.0)
+        hi = max(hi, 0.0)
+        return lo, hi
+    return float(vmin), float(vmax)
 
 
 def scalar_to_rgba(
@@ -1077,17 +1088,51 @@ def _scalar_listed_colormap() -> ListedColormap:
 
 
 def _draw_scalar_colorbar(
-    fig, gs_slot, vmin: float, vmax: float, label: str = r"$\alpha$ (°)"
+    fig,
+    gs_slot,
+    vmin: float,
+    vmax: float,
+    scalar_key: str = "alpha_par",
+    scalar_vmin_linear: Optional[float] = None,
+    scalar_vmax_linear: Optional[float] = None,
 ):
+    """Draw colorbar in normalization space; gamma uses log ticks at linear values."""
     ax = fig.add_subplot(gs_slot)
     cmap = _scalar_listed_colormap()
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    cb = fig.colorbar(
-        plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-        cax=ax,
-        orientation="vertical",
-    )
-    cb.set_label(label, fontsize=10)
+    if _is_logspace_scalar(scalar_key):
+        vcenter = _scalar_vcenter(scalar_key)
+        if vcenter is not None and vmin < vcenter < vmax:
+            norm = TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+            ticks = [vmin, vcenter, vmax]
+            if scalar_vmin_linear is not None and scalar_vmax_linear is not None:
+                labels = [
+                    f"{scalar_vmin_linear:g}",
+                    "1.0",
+                    f"{scalar_vmax_linear:g}",
+                ]
+            else:
+                labels = [f"{np.exp(t):.3g}" for t in ticks]
+                labels[1] = "1.0"
+        else:
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            ticks = [vmin, vmax]
+            labels = [f"{np.exp(t):.3g}" for t in ticks]
+        cb = fig.colorbar(
+            plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+            cax=ax,
+            orientation="vertical",
+        )
+        cb.set_label(r"$\gamma$", fontsize=10)
+        cb.set_ticks(ticks)
+        cb.set_ticklabels(labels)
+    else:
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        cb = fig.colorbar(
+            plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+            cax=ax,
+            orientation="vertical",
+        )
+        cb.set_label(r"$\alpha$ (°)", fontsize=10)
     cb.ax.tick_params(labelsize=8)
 
 
@@ -1106,23 +1151,24 @@ def plot_deformation_comparison(
     schematic_scale: float = 1.0,
 ):
     """
-    Figure 3: 4x4 grid of deformation schematics and scalar-colored Voronoi panels.
+    Deformation grid: schematics + scalar-colored Voronoi panels (fig3/fig4).
 
     Each entry in `columns` must provide:
-        key        : deformation id ("curve", "cylinder_sq", "sphere_sq", "sphere_pu")
-        scalar     : "alpha_par" or "alpha_perp"
+        scalar     : e.g. "alpha_par", "alpha_perp", or "gamma"
         frames     : [initial_idx, during_idx, post_idx]
+        data       : loaded pkl dict
+        key        : optional deformation id for matplotlib fallback schematics
         rotation   : optional {"axis": "x", "degrees": 90}
-        data       : loaded pkl dict with x, p, alpha_par, alpha_perp lists
-        schematic_svg : optional per-column SVG path (overridden by schematic_svgs)
-        schematic_scale : optional per-column zoom for row-0 illustration
+        schematic_svg / schematic_scale : optional per-column overrides
 
-    schematic_svgs : optional list of 4 SVG paths for row-0 deformation illustrations.
-    schematic_scale : zoom factor for deformation-type row (>1 = larger, default 1.0).
-    schematic_dpi  : rasterization DPI for SVGs (auto-boosted when scale > 1).
+    schematic_svgs : optional list of SVG paths (one per column) for row 0.
+    scalar_vmin/vmax : linear scale (alpha degrees, or gamma e.g. 0.5–1.5).
     """
-    if len(columns) != 4:
-        raise ValueError(f"Expected 4 columns, got {len(columns)}")
+    if len(columns) < 1:
+        raise ValueError(f"Expected at least 1 column, got {len(columns)}")
+
+    n_cols = len(columns)
+    scalar_key = columns[0]["scalar"]
 
     base_render = _merge_render_settings(
         render_settings, voronoi_edge_color, voronoi_edge_width
@@ -1130,7 +1176,8 @@ def plot_deformation_comparison(
     base_render["window_size"] = panel_window_size
     if "zoom_margin" not in (render_settings or {}):
         base_render["zoom_margin"] = 0.06
-    vmin, vmax = float(scalar_vmin), float(scalar_vmax)
+    vmin_linear, vmax_linear = float(scalar_vmin), float(scalar_vmax)
+    vmin, vmax = _scalar_norm_bounds(scalar_key, vmin_linear, vmax_linear)
     svg_paths = _resolve_schematic_svgs(columns, schematic_svgs)
     schematic_images = []
     for col_idx, path in enumerate(svg_paths):
@@ -1141,22 +1188,22 @@ def plot_deformation_comparison(
         load_dpi = int(schematic_dpi * max(1.0, float(col_scale)))
         schematic_images.append(load_svg_as_array(path, dpi=load_dpi))
 
-    rendered = [[None] * 4 for _ in range(4)]
+    rendered = [[None] * n_cols for _ in range(4)]
     for col_idx, col in enumerate(columns):
-        kind = col["key"]
-        scalar_key = col["scalar"]
+        col_scalar = col["scalar"]
+        col_label = col.get("key", f"col_{col_idx}")
         rotation = col.get("rotation")
         data = col["data"]
         frames = col["frames"]
         if len(frames) != 3:
-            raise ValueError(f"Column {kind!r} must have exactly 3 frame indices")
+            raise ValueError(f"Column {col_label!r} must have exactly 3 frame indices")
 
         for row_idx, frame in enumerate(frames, start=1):
             panel_settings = {
                 **base_render,
                 "color_mode": "scalar",
-                "scalar_key": scalar_key,
-                "scalar_values": np.asarray(data[scalar_key][frame], dtype=np.float32),
+                "scalar_key": col_scalar,
+                "scalar_values": np.asarray(data[col_scalar][frame], dtype=np.float32),
                 "scalar_vmin": vmin,
                 "scalar_vmax": vmax,
             }
@@ -1168,12 +1215,13 @@ def plot_deformation_comparison(
                 settings=panel_settings,
             )
 
-    width_ratios = [0.10, 0.78, 1.28, 1.28, 1.28, 1.28, 0.12]
+    width_ratios = [0.10, 0.78] + [1.28] * n_cols + [0.12]
     height_ratios = [0.62, 1.12, 1.12, 1.12]
+    n_gs_cols = 2 + n_cols + 1
     fig = plt.figure(figsize=figsize)
     gs = fig.add_gridspec(
         4,
-        7,
+        n_gs_cols,
         width_ratios=width_ratios,
         height_ratios=height_ratios,
         wspace=0.015,
@@ -1231,12 +1279,21 @@ def plot_deformation_comparison(
                 schematic_img = schematic_images[col_idx]
                 if schematic_img is not None:
                     _show_schematic_on_ax(ax, schematic_img, scale=col_scale)
-                else:
+                elif col.get("key"):
                     draw_deformation_schematic(ax, col["key"], scale=col_scale)
             else:
                 ax.imshow(rendered[row_idx][col_idx], aspect="equal")
 
-    _draw_scalar_colorbar(fig, gs[1:4, 6], vmin, vmax)
+    cb_col = 2 + n_cols
+    _draw_scalar_colorbar(
+        fig,
+        gs[1:4, cb_col],
+        vmin,
+        vmax,
+        scalar_key=scalar_key,
+        scalar_vmin_linear=vmin_linear if _is_logspace_scalar(scalar_key) else None,
+        scalar_vmax_linear=vmax_linear if _is_logspace_scalar(scalar_key) else None,
+    )
 
     if output_path:
         fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.03)

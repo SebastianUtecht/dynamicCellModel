@@ -1,0 +1,107 @@
+{
+  "output_folder": "05_07_GAMMA/squeeze_sheet_2",
+  "yield_every": 50,
+  "yield_steps": 2000,
+  "device": "cuda",
+  "dtype": "torch.float32",
+  "random_seed": 50,
+  "k": 18,
+  "prolif_rate": [
+    0.0,
+    0.0
+  ],
+  "prolif_delay": 0,
+  "max_cells": 20000,
+  "lambdas": [
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ],
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ],
+    [
+      0.0,
+      0.8,
+      0.2,
+      0.0
+    ]
+  ],
+  "etas": [
+    0.0,
+    0.0
+  ],
+  "polar_etas": [
+    0.0,
+    0.0
+  ],
+  "alpha_params": [
+    [
+      [
+        0,
+        "locked"
+      ],
+      [
+        0,
+        "locked"
+      ]
+    ],
+    [
+      [
+        0,
+        "locked"
+      ],
+      [
+        0,
+        "locked"
+      ]
+    ]
+  ],
+  "alpha_range": 60.0,
+  "gamma_params": [
+    [
+      1.0,
+      "free"
+    ],
+    [
+      1.0,
+      "free"
+    ]
+  ],
+  "gamma_range": 2.0,
+  "cell_wall_interaction": 0.0,
+  "dt": 0.1,
+  "nematic_pcp": false,
+  "update_cells_bools": [
+    true,
+    true
+  ],
+  "wedge_pcp": true,
+  "bound_type": "planes",
+  "bound_extents": [
+    40,
+    20
+  ],
+  "bound_move_times": [
+    2000,
+    20000
+  ],
+  "bound_continuity": 20000,
+  "stretch_bound_axis": 0,
+  "stretch_type": "straight",
+  "force_stretch": false,
+  "grav_str": 0.05,
+  "stretch_factor": 0.0,
+  "stretch_time_stop": 50000,
+  "delete_stretch_cells": false,
+  "propagate_1stretch": true,
+  "gamma_diff_penalty": 0.1,
+  "gamma_update_speed": 1.0,
+  "screen_out_defects": false,
+  "notes": "squeeze_sheet_2"
+}

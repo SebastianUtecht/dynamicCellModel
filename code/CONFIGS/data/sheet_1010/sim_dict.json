@@ -1,0 +1,62 @@
+{
+  "output_folder": "CONFIGS/sheet_1010",
+  "yield_every": 50,
+  "yield_steps": 100,
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "random_seed": 50,
+  "k": 18,
+  "prolif_rate": 0.0,
+  "prolif_delay": 0,
+  "max_cells": 20000,
+  "lambdas": [
+    0.0,
+    0.8,
+    0.2,
+    0.0
+  ],
+  "etas": 0.0,
+  "polar_etas": 0.0,
+  "alpha_params": [
+    [
+      0,
+      "locked"
+    ],
+    [
+      0,
+      "locked"
+    ]
+  ],
+  "alpha_range": 45.0,
+  "gamma_params": [
+    1.0,
+    "locked"
+  ],
+  "gamma_range": 2.0,
+  "cell_wall_interaction": 0.0,
+  "dt": 0.1,
+  "nematic_pcp": false,
+  "update_x_bools": [
+    true,
+    true
+  ],
+  "wedge_pcp": true,
+  "equi_time": 2000,
+  "bound_type": null,
+  "bound_extents": [
+    24,
+    8
+  ],
+  "bound_move_times": 10000,
+  "bound_continuity": 1000,
+  "stretch_bound_axis": 0,
+  "stretch_type": [
+    null
+  ],
+  "force_stretch": false,
+  "stretch_factor": 0.0,
+  "stretch_time_stop": 30000,
+  "gamma_diff_penalty": 0.0,
+  "screen_out_defects": false,
+  "notes": "sheet_1010"
+}
