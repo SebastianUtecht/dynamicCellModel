@@ -67,26 +67,28 @@ class Simulation:
         self.prolif_rate    = sim_dict['prolif_rate']       # Probability of cell proliferation for each cell
         self.prolif_delay   = sim_dict['prolif_delay']      # Delay before cell proliferation
         self.nematic_pcp    = sim_dict['nematic_pcp']     # Whether planar cell polarity is nematic (True) or vectorial (False)
-        self.update_cells_bools = sim_dict['update_cells_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
+        self.update_x_bools = sim_dict['update_x_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
         self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
         self.wedge_pcp = sim_dict['wedge_pcp']                     # Whether to apply wedging rotations to the PCP as well as the ABP. Only relevant if alpha parameters are non-zero
         
+        ### Parameters for this paper ###
+        self.equi_time          = sim_dict['equi_time']             # Time to equilibrate before starting the simulation. Only relevant if stretch_factor is not 0
+
         # Boundary parameters
         self.bound_type         = sim_dict['bound_type']
         assert self.bound_type == 'planes' or self.bound_type == 'cylinder' or self.bound_type == None, 'Boundtype expected to be in ["planes", "cylinder", None]'
-        self.bound_extents      = sim_dict['bound_extents']      # Extents for boundary conditions. For planes, this is the x and y extent. For cylinder, this is the radius and height
-        self.bound_move_times   = sim_dict['bound_move_times']   # If using planes, this is the times at which the planes move. For cylinder, this is the time at which the cylinder starts moving
+        self.bound_extents      = [sim_dict['bound_end']]      # Extents for boundary conditions. For planes, this is the x and y extent. For cylinder, this is the radius and height
+        self.bound_move_times   = [self.equi_time, sim_dict['bound_move_times']]   # If using planes, this is the times at which the planes move. For cylinder, this is the time at which the cylinder starts moving
         self.bound_continuity   = sim_dict['bound_continuity']   # Continuity for boundary conditions
-        self.bound_speed        = (self.bound_extents  [1] - self.bound_extents[0]) / ( (self.bound_move_times[1] - self.bound_move_times[0]) )  if self.bound_move_times is not None else 0.0 # Speed of boundary movement. Only relevant if bound_move_times is not None
         self.bound_cur_ext      = self.bound_extents[0] if self.bound_move_times is not None else None # Current extent of the boundary. Only relevant if bound_move_times is not None
 
         # Stretching parameters
         self.stretch_factor     = sim_dict['stretch_factor']        # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
-        self.stretch_time_stop  = sim_dict['stretch_time_stop']      # The time at which the stretch stops. Only relevant if stretch_factor is not 0
-        self.stretch_bound_axis = sim_dict['stretch_bound_axis'] # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
-        self.stretch_type       = sim_dict['stretch_type']       # The type of stretching to apply. Only relevant if stretch_factor is not 0
-        self.force_stretch      = sim_dict['force_stretch']       # Whether to force the stretch to be applied. Only relevant if stretch_factor is not 0
-        
+        self.stretch_time_stop  = sim_dict['stretch_time_stop']     # The time at which the stretch stops. Only relevant if stretch_factor is not 0
+        self.stretch_bound_axis = sim_dict['stretch_bound_axis']    # The axis along which the stretch is applied. 0 for x, 1 for y, 2 for z. Only relevant if stretch_factor is not 0
+        self.stretch_type       = sim_dict['stretch_type']          # The type of stretching to apply. Only relevant if stretch_factor is not 0
+
+
         # Relaxation length parameters 
         self.r0             = 5*np.log(5)/(5-1)
         self.r0_val         = np.exp(-self.r0)-np.exp(-self.r0/5)
@@ -134,7 +136,6 @@ class Simulation:
         self.get_neighbors = self.get_neighbors_vor        
         self.use_trans_neighbors = True
         self.gamma_diff_penalty = sim_dict['gamma_diff_penalty']
-        self.gamma_update_speed = sim_dict['gamma_update_speed']    
 
         # Set random seed
         torch.manual_seed(self.random_seed)                 # For reproducibility
@@ -622,7 +623,7 @@ class Simulation:
             # If p_mask == 1 cells are not updated we don't count them for the 
             # gamma penalty
 
-            if not(self.update_cells_bools[1]):
+            if not(self.update_x_bools[1]):
                 masked_out_cells = torch.logical_or((interaction_mask == 2) , (interaction_mask == 1)) * (~z_mask)
             else:
                 masked_out_cells = ~z_mask
@@ -631,7 +632,7 @@ class Simulation:
             gamma_diff_sum = torch.sum(gamma_diff)
             Vij_sum += gamma_diff_sum * self.gamma_diff_penalty
 
-        if self.tstep > 1_000:
+        if self.tstep > self.equi_time:
             # Boundary conditions
             bc = self.bound(x)
         else:
@@ -680,6 +681,12 @@ class Simulation:
 
         p_mask = torch.tensor(p_mask, dtype=torch.int, device=self.device)
         self.beta   = torch.zeros(x.shape[0], dtype=self.dtype, device=self.device) # Initialization of beta tensor. Used for cell division.
+
+        # we set bound_ext[0] to the largest distance between two cells alng self.stretch_bound_axis. This is used for stretching the tissue in the right direction.
+        max_dist   = torch.max(x[:,self.stretch_bound_axis]) - torch.min(x[:,self.stretch_bound_axis]) + 4.0
+        self.bound_extents =  [max_dist] + self.bound_extents
+        self.bound_speed        = (self.bound_extents[1] - self.bound_extents[0]) / ( (self.bound_move_times[1] - self.bound_move_times[0]) )  if self.bound_move_times is not None else 0.0 # Speed of boundary movement. Only relevant if bound_move_times is not None
+
 
         # We calculate the initial x_mass_midpoint for stretching purposes.
         with torch.no_grad():
@@ -753,7 +760,7 @@ class Simulation:
         self.division, x, p, q, p_mask, self.beta, alpha_par, alpha_perp, gamma = self.cell_division(x, p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         # Advance any stateful boundary/stretch logic once per timestep (beginning-of-step).
-        if self.tstep > 1_000:
+        if self.tstep > self.equi_time:
             with torch.no_grad():
                 self.advance_boundary_state()
 
@@ -761,7 +768,6 @@ class Simulation:
         self.refresh_potential_neighbours_once(x, self.k)
         idx_base = self.idx
 
-        # 
         d1, dx1, idx1, z_mask1 = self.true_neighbours_from_idx(x, p, q, gamma, idx_base)
         V1, Vi, defect_mask = self.potential(x, p, q, p_mask,
                                              alpha_par, alpha_perp, gamma,
@@ -771,26 +777,14 @@ class Simulation:
             V1, (x, p, q, alpha_par, alpha_perp, gamma), create_graph=False, retain_graph=False
         )
 
-        if (self.stretch_factor != 0.0 and self.force_stretch) and self.tstep > 1_000:
-            mask = (p_mask == 1)  # Only apply to the first cell type
-            # we subtract all of the x-gradient/force parallel to the stretch axis from the update:
-            stretch_bound_vec = torch.zeros_like(x[mask])
-            stretch_bound_vec[:, self.stretch_bound_axis] = 1.0
-
-            g1_x_parallel = torch.sum(g1_x[mask] * stretch_bound_vec, dim=1, keepdim=True) * stretch_bound_vec
-            g1_x[mask] -= g1_x_parallel 
-
         # Shared noise for additive-noise predictor/corrector
         with torch.no_grad():
             xi_x = torch.empty_like(x).normal_()
-            # Rotational noise for p/q: random axis + small angle (eta is angular std dev in radians)
-            # we make axis_p and axis_q perpendicular to p and q respectively by taking a random vector and projecting out the parallel component, then normalizing. This ensures the noise is purely rotational and does not change the magnitude of p and q. 
-            
             xi_p = torch.empty_like(p).normal_()
-            xi_p = xi_p - torch.sum(xi_p * p, dim=1, keepdim=True) * p
-
             xi_q = torch.empty_like(q).normal_()
-            xi_q = xi_q - torch.sum(xi_q * q, dim=1, keepdim=True) * q
+            xi_alpha_par = torch.empty_like(alpha_par).normal_()
+            xi_alpha_perp = torch.empty_like(alpha_perp).normal_()
+            xi_gamma = torch.empty_like(gamma).normal_()
 
             # Predictor state
             x_tilde = x.clone()
@@ -801,24 +795,24 @@ class Simulation:
             gamma_tilde = gamma.clone()
 
             for i, eta in enumerate(self.eta_lst):
-                if not self.update_cells_bools[i]:
-                    continue
                 mask = (p_mask == i)
 
                 polar_eta = self.polar_eta_lst[i]
 
-                x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
+                if self.update_x_bools[i]:
+                    x_tilde[mask] += (-g1_x[mask] * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
                 p_tilde[mask] += (-g1_p[mask] * self.dt) + (polar_eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the predictor, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
                 q_tilde[mask] += (-g1_q[mask] * self.dt) + (polar_eta * xi_q[mask] * self.sqrt_dt)
 
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt)    #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
+                if self.tstep > self.equi_time:
+                    if self.alpha_par_bool_lst[i]:
+                        alpha_par_tilde[mask] += (-g1_alpha_par[mask] * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
 
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt)  #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
+                    if self.alpha_perp_bool_lst[i]:
+                        alpha_perp_tilde[mask] += (-g1_alpha_perp[mask] * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
 
-                if self.gamma_bool_lst[i]:
-                    gamma_tilde[mask] += self.gamma_update_speed * (-g1_gamma[mask] * self.dt)
+                    if self.gamma_bool_lst[i]:
+                        gamma_tilde[mask] += (-g1_gamma[mask] * self.dt) + (eta * xi_gamma[mask] * self.sqrt_dt)
 
             # Apply constraints before stage 2 drift evaluation
             p_tilde, q_tilde, alpha_par_tilde, alpha_perp_tilde, gamma_tilde = self.apply_constraints(
@@ -846,39 +840,33 @@ class Simulation:
             create_graph=False, retain_graph=False
         )
 
-        if self.stretch_factor != 0.0 and self.force_stretch:
-            mask = (p_mask == 1)  # Only apply to the first cell type
-            # we subtract all of the x-gradient/force parallel to the stretch axis from the update:
-            g2_x_parallel = torch.sum(g2_x[mask] * stretch_bound_vec, dim=1, keepdim=True) * stretch_bound_vec
-            g2_x[mask] -= g2_x_parallel 
-
         # ------------------------
         # Corrector (Heun)
         # ------------------------
         with torch.no_grad():
             for i, eta in enumerate(self.eta_lst):
-                if not self.update_cells_bools[i]:
-                    continue
                 mask = p_mask == i
 
-                x[mask] += (-0.5 * (g1_x[mask] + g2_x[mask]) * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
+                if self.update_x_bools[i]:
+                    x[mask] += (-0.5 * (g1_x[mask] + g2_x[mask]) * self.dt) + (eta * xi_x[mask] * self.sqrt_dt)
                 p[mask] += (-0.5 * (g1_p[mask] + g2_p[mask]) * self.dt) + (eta * xi_p[mask] * self.sqrt_dt)  # We add the rotational noise as an Euler step for the corrector, then apply the actual rotation after calculating the angle. This is to ensure the noise is properly scaled by eta and sqrt_dt, and to keep the code simpler.
                 q[mask] += (-0.5 * (g1_q[mask] + g2_q[mask]) * self.dt) + (eta * xi_q[mask] * self.sqrt_dt)
 
-                if self.alpha_par_bool_lst[i]:
-                    alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) #+ (eta * xi_alpha_par[mask] * self.sqrt_dt)
+                if self.tstep > self.equi_time:
+                    if self.alpha_par_bool_lst[i]:
+                        alpha_par[mask] += (-0.5 * (g1_alpha_par[mask] + g2_alpha_par[mask]) * self.dt) + (eta * xi_alpha_par[mask] * self.sqrt_dt)
 
-                if self.alpha_perp_bool_lst[i]:
-                    alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) #+ (eta * xi_alpha_perp[mask] * self.sqrt_dt)
+                    if self.alpha_perp_bool_lst[i]:
+                        alpha_perp[mask] += (-0.5 * (g1_alpha_perp[mask] + g2_alpha_perp[mask]) * self.dt) + (eta * xi_alpha_perp[mask] * self.sqrt_dt)
 
-                if self.gamma_bool_lst[i]:
-                    gamma[mask] += self.gamma_update_speed * (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt) #+ (eta * xi_gamma[mask] * self.sqrt_dt)
+                    if self.gamma_bool_lst[i]:
+                        gamma[mask] += (-0.5 * (g1_gamma[mask] + g2_gamma[mask]) * self.dt) + (eta * xi_gamma[mask] * self.sqrt_dt)
 
             # Final constraints
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         with torch.no_grad():
-            if self.stretch_factor != 0.0 and self.tstep > 1_000:
+            if self.stretch_factor != 0.0 and self.tstep > self.equi_time:
                 if self.stretch_type == 'straight':
                     x[:,self.stretch_bound_axis][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
                 elif self.stretch_type == 'curved':
@@ -902,8 +890,6 @@ class Simulation:
                         direction_right = self.safe_normalize(torch.cross(axis, radii_right, dim=1), dim=1)
                         x[self.left_ones] += self.stretch_factor * self.dt * direction_left
                         x[self.right_ones] += self.stretch_factor * self.dt * direction_right
-                        p[self.left_ones] = -direction_left
-                        p[self.right_ones] = -direction_right
 
                         min_dist_left_right = x[self.left_ones][:,None] - x[self.right_ones][None,:]
                         min_dist_left_right = torch.norm(min_dist_left_right, dim=2)
@@ -917,25 +903,15 @@ class Simulation:
 
                 if self.tstep >= self.stretch_time_stop:
                     self.stretch_factor = 0.0
-                    
-                    # delete cells for p_mask == 1
-                    x = x[p_mask != 1]
-                    p = p[p_mask != 1]
-                    q = q[p_mask != 1]
-                    gamma = gamma[p_mask != 1]
-                    alpha_par = alpha_par[p_mask != 1]
-                    alpha_perp = alpha_perp[p_mask != 1]
-                    p_mask = p_mask[p_mask != 1]
 
-                    x.requires_grad = True
-                    p.requires_grad = True
-                    q.requires_grad = True
-                    alpha_par.requires_grad = True
-                    alpha_perp.requires_grad = True
-                    gamma.requires_grad = True
-
-                    self.d, self.idx = self.find_potential_neighbours(x, self.k)   # We need to update the neighbors after deleting cells
-                    self.lambdas = self.lambdas[0]   # We also need to update the lambdas after deleting cells as we only have one cell type now
+                    # Let pulled cells go
+                    p_mask[p_mask == 1] = 0
+                    self.eta_lst = [self.eta0]
+                    self.polar_eta_lst = [self.polar_eta0]
+                    self.alpha_par_bool_lst = [self.type0_alpha_par_free, False]
+                    self.alpha_perp_bool_lst = [self.type0_alpha_perp_free, False]
+                    self.gamma_bool_lst = [self.type0_gamma_free, False]
+                    self.lambdas = self.lambdas[0]
 
         return x, p, q, p_mask, alpha_par, alpha_perp, gamma, Vi, defect_mask  #Returning the goods.
 
@@ -1038,8 +1014,7 @@ class Simulation:
                 b0      = beta[idx]
                 alpha_par0 = alpha_par[idx]
                 alpha_perp0 = alpha_perp[idx]
-                # gamma0 = gamma[idx]
-                gamma0 = torch.ones_like(b0, device=self.device, dtype=self.dtype) #for now let's just do new cells have no elongation.
+                gamma0 = gamma[idx]
 
                 # make a random vector
                 move = torch.empty_like(x0).normal_()
@@ -1237,7 +1212,7 @@ def run_simulation(sim_dict):
 
     save((p_mask_lst, x_lst, p_lst,  q_lst, alpha_par_lst, alpha_perp_lst, gamma_lst, energy_lst, defect_mask_lst), name='data', output_folder=output_folder)  # Last iteration is saved
 
-def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_params=None):
+def make_sphere(N, type0_frac, alpha_params=None, gamma_params=None):
     """
     Generates cells uniformly distributed within a sphere with randomly
     initialized polarities
@@ -1254,20 +1229,22 @@ def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_param
             - p (np.ndarray): The apicobasal polarities of the cells.
             - q (np.ndarray): The planar cell polarities of the cells
     """
+    cell_area = np.sqrt(3) / 2 * 2.1**2
+    radius = np.sqrt(N * cell_area / (4 * np.pi))
+    range = np.arange(N)
+    angle = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1 - (2*range + 1)/N
+    r = np.sqrt(1 - z*z)
+    theta = angle * range
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    x = radius * np.column_stack((x, y, z))
 
-    # Generate random positions within a sphere
-    x = np.random.randn(N, 3)
-    r = radius * np.random.rand(N)**(1/3.)
-    x /= np.sqrt(np.sum(x**2, axis=1))[:, None]
-    x *= r[:, None]
+    p = x / np.linalg.norm(x, axis=1)[:, None]
+    q = np.cross(p, np.array([1, 0, 0])) / np.linalg.norm(np.cross(p, np.array([1, 0, 0])), axis=1)[:, None]
 
-    # Generate random polarities
-    p = np.random.randn(N, 3)
-    p /= np.sqrt(np.sum(p**2, axis=1))[:,None]
-    q = np.random.randn(N, 3)
-    q /= np.sqrt(np.sum(q**2, axis=1))[:,None]
 
-    # Generate random cell types with specified fractions
+    # # Generate random cell types with specified fractions
     mask = np.random.choice([0,1], p=[type0_frac, 1-type0_frac], size=N)                #Mask detailing which cells are which type
 
     alpha_par = np.zeros(N)
@@ -1294,8 +1271,8 @@ def make_random_sphere(N, type0_frac , radius=30, alpha_params=None, gamma_param
         alpha_perp[:]   = alpha_params[1][0] * np.pi/180.0
         gamma[:]        = np.log(gamma_params[0])
 
-
     sphere_data = (mask, x, p, q, alpha_par, alpha_perp, gamma)
+
     return sphere_data
 
 def make_sphere_surface_stretch(N, stretch_frac, mirrored=True, 
