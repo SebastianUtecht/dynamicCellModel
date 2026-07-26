@@ -641,7 +641,7 @@ class Simulation:
         V = Vij_sum + bc
 
         num_neighbors = torch.sum(z_mask, dim=1)           
-        Vij_normed = Vij / num_neighbors[:, None]       
+        Vij_normed = Vij / num_neighbofrs[:, None]       
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
