@@ -200,7 +200,7 @@ To test the effects of reactive cell wedging and reactive cell contraction and e
   - Consider keeping ABP and PCP as unit vectors on sphere figure
   - Include scale bars in all illustrations and seek to keep them as similar as possible
   - Keep all variables as close to each other as possible. Might need to redo some simulations here due to noise, deformation times, cell counts etc. Look into this.
-  - Mark subset of pulled cells AND subset of screened out defect cells where applicable
+  - Mark subConset of pulled cells AND subset of screened out defect cells where applicable
   - Make null-case figures for everything
   - For figure 4: Redo stretch straight stretch such that the initial configuration doesn't look wonky
   - For figure 3+4: Add additional row displaying the peak deformation before it is let go.

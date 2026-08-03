@@ -274,6 +274,24 @@ def compute_scalar_ranges(columns: List[dict]) -> Dict[str, Tuple[float, float]]
     return ranges
 
 
+def _as_rgb(color) -> np.ndarray:
+    """Convert hex / RGB(A) sequence to length-3 float RGB in [0, 1]."""
+    if isinstance(color, str):
+        color = color.lstrip("#")
+        if len(color) == 3:
+            color = "".join(c * 2 for c in color)
+        if len(color) != 6:
+            raise ValueError(f"Unsupported hex color {color!r}")
+        return np.array(
+            [int(color[i : i + 2], 16) / 255.0 for i in (0, 2, 4)],
+            dtype=np.float32,
+        )
+    arr = np.asarray(color, dtype=np.float32).ravel()
+    if arr.size < 3:
+        raise ValueError(f"color must have at least 3 channels, got {arr.size}")
+    return arr[:3]
+
+
 def _cell_colors(x, cam_pos, settings):
     """Per-cell RGB for Voronoi rendering (distance or scalar mode)."""
     if settings.get("color_mode") == "scalar":
@@ -288,8 +306,22 @@ def _cell_colors(x, cam_pos, settings):
             vmin = float(vals_t.min())
         if vmax is None:
             vmax = float(vals_t.max())
-        return scalar_colors(key, scalar_values, vmin, vmax)
-    return _distance_colors(x, cam_pos, settings)
+        colors = scalar_colors(key, scalar_values, vmin, vmax)
+    else:
+        colors = _distance_colors(x, cam_pos, settings)
+
+    highlight_mask = settings.get("highlight_mask")
+    if highlight_mask is not None:
+        mask = np.asarray(highlight_mask, dtype=bool).ravel()
+        if mask.shape[0] != colors.shape[0]:
+            raise ValueError(
+                f"highlight_mask length {mask.shape[0]} must match "
+                f"n_cells {colors.shape[0]}"
+            )
+        colors = np.asarray(colors, dtype=np.float32).copy()
+        highlight_color = settings.get("highlight_color", (0.55, 0.82, 0.98))
+        colors[mask] = _as_rgb(highlight_color)
+    return colors
 
 
 def build_voronoi_meshes(x, p, settings=None) -> dict[int, VoronoiMesh]:
@@ -1095,6 +1127,9 @@ def _draw_scalar_colorbar(
     scalar_key: str = "alpha_par",
     scalar_vmin_linear: Optional[float] = None,
     scalar_vmax_linear: Optional[float] = None,
+    label: Optional[str] = None,
+    label_fontsize: float = 10,
+    tick_fontsize: float = 8,
 ):
     """Draw colorbar in normalization space; gamma uses log ticks at linear values."""
     ax = fig.add_subplot(gs_slot)
@@ -1122,7 +1157,10 @@ def _draw_scalar_colorbar(
             cax=ax,
             orientation="vertical",
         )
-        cb.set_label(r"$\gamma$", fontsize=10)
+        cb.set_label(
+            label if label is not None else r"$\gamma$",
+            fontsize=label_fontsize,
+        )
         cb.set_ticks(ticks)
         cb.set_ticklabels(labels)
     else:
@@ -1132,8 +1170,11 @@ def _draw_scalar_colorbar(
             cax=ax,
             orientation="vertical",
         )
-        cb.set_label(r"$\alpha$ (°)", fontsize=10)
-    cb.ax.tick_params(labelsize=8)
+        cb.set_label(
+            label if label is not None else r"$\alpha$ (°)",
+            fontsize=label_fontsize,
+        )
+    cb.ax.tick_params(labelsize=tick_fontsize)
 
 
 def plot_deformation_comparison(
@@ -1299,3 +1340,425 @@ def plot_deformation_comparison(
         fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.03)
 
     return fig
+
+
+def plot_deformation_comparison_clean(
+    columns,
+    render_settings=None,
+    output_path=None,
+    figsize=(14, 8),
+    voronoi_edge_color=None,
+    voronoi_edge_width=None,
+    scalar_vmin: float = -60.0,
+    scalar_vmax: float = 60.0,
+    panel_window_size: Tuple[int, int] = (720, 720),
+    wspace: float = 0.0,
+    hspace: float = 0.0,
+    colorbar_label: Optional[str] = None,
+    colorbar_fontsize: float = 20,
+):
+    """
+    Clean deformation grid: scalar-colored Voronoi panels + colorbar only.
+
+    Same `columns` contract as plot_deformation_comparison, but without
+    schematics, time arrow, or row category labels. Number of rows equals
+    len(columns[i]["frames"]); all columns must share the same frame count.
+
+    Optional per-column keys:
+        highlight_p_mask : if True, color cells with data['p_mask']==1 light blue
+        highlight_color  : override highlight RGB/hex (default light blue)
+        panel_scale      : display scale (>1 enlarges past axes bounds, no clip)
+        zoom_margin      : optional camera zoom override for this column only
+
+    colorbar_label : override colorbar text; default is theta (°) for linear
+        scalars and gamma for log-space scalars.
+    colorbar_fontsize : font size for colorbar axis label and tick labels.
+
+    Figure width is scaled with the number of columns relative to a 4-column
+    reference (the default figsize), so 1-column figures keep the same
+    absolute colorbar width and panel gap as fig3/fig4.
+    """
+    if len(columns) < 1:
+        raise ValueError(f"Expected at least 1 column, got {len(columns)}")
+
+    n_cols = len(columns)
+    n_rows = len(columns[0]["frames"])
+    if n_rows < 1:
+        raise ValueError("Expected at least 1 frame index per column")
+    scalar_key = columns[0]["scalar"]
+
+    base_render = _merge_render_settings(
+        render_settings, voronoi_edge_color, voronoi_edge_width
+    )
+    base_render["window_size"] = panel_window_size
+    if "zoom_margin" not in (render_settings or {}):
+        base_render["zoom_margin"] = 0.06
+    vmin_linear, vmax_linear = float(scalar_vmin), float(scalar_vmax)
+    vmin, vmax = _scalar_norm_bounds(scalar_key, vmin_linear, vmax_linear)
+
+    rendered = [[None] * n_cols for _ in range(n_rows)]
+    panel_scales = [float(col.get("panel_scale", 1.0)) for col in columns]
+    for col_idx, col in enumerate(columns):
+        col_scalar = col["scalar"]
+        col_label = col.get("key", f"col_{col_idx}")
+        rotation = col.get("rotation")
+        data = col["data"]
+        frames = col["frames"]
+        if len(frames) != n_rows:
+            raise ValueError(
+                f"Column {col_label!r} has {len(frames)} frames, expected {n_rows}"
+            )
+
+        for row_idx, frame in enumerate(frames):
+            panel_settings = {
+                **base_render,
+                "color_mode": "scalar",
+                "scalar_key": col_scalar,
+                "scalar_values": np.asarray(data[col_scalar][frame], dtype=np.float32),
+                "scalar_vmin": vmin,
+                "scalar_vmax": vmax,
+            }
+            if rotation:
+                panel_settings["rotation"] = rotation
+            if "zoom_margin" in col:
+                panel_settings["zoom_margin"] = float(col["zoom_margin"])
+
+            if col.get("highlight_p_mask"):
+                if "p_mask" not in data:
+                    raise KeyError(
+                        f"Column {col_label!r} requested highlight_p_mask but "
+                        f"data has no 'p_mask'"
+                    )
+                p_mask = np.asarray(data["p_mask"][frame])
+                panel_settings["highlight_mask"] = p_mask == 1
+                if "highlight_color" in col:
+                    panel_settings["highlight_color"] = col["highlight_color"]
+                else:
+                    panel_settings["highlight_color"] = (0.55, 0.82, 0.98)
+
+            rendered[row_idx][col_idx] = render_voronoi_cluster(
+                data["x"][frame],
+                data["p"][frame],
+                settings=panel_settings,
+            )
+
+    width_ratios = [1.28] * n_cols + [0.12]
+    height_ratios = [1.12] * n_rows
+    # Default figsize is tuned for a ~4-column layout (fig3). Scale width with
+    # n_cols so a single-column figure keeps the same absolute colorbar width
+    # and panel-to-colorbar gap instead of stretching across the full width.
+    _ref_n_cols = 4
+    _panel_wr, _cb_wr = 1.28, 0.12
+    fig_w, fig_h = float(figsize[0]), float(figsize[1])
+    ref_units = _panel_wr * _ref_n_cols + _cb_wr
+    cur_units = _panel_wr * n_cols + _cb_wr
+    fig_w = fig_w * (cur_units / ref_units)
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(
+        n_rows,
+        n_cols + 1,
+        width_ratios=width_ratios,
+        height_ratios=height_ratios,
+        wspace=wspace,
+        hspace=hspace,
+    )
+    fig.patch.set_facecolor("white")
+
+    for row_idx in range(n_rows):
+        for col_idx in range(n_cols):
+            ax = fig.add_subplot(gs[row_idx, col_idx])
+            # Reuse schematic overflow display: scale>1 grows past axes bounds.
+            _show_schematic_on_ax(
+                ax,
+                rendered[row_idx][col_idx],
+                scale=panel_scales[col_idx],
+            )
+
+    if colorbar_label is not None:
+        resolved_cb_label = colorbar_label
+    elif _is_logspace_scalar(scalar_key):
+        resolved_cb_label = None
+    else:
+        resolved_cb_label = r"$\theta$ (°)"
+
+    _draw_scalar_colorbar(
+        fig,
+        gs[0:n_rows, n_cols],
+        vmin,
+        vmax,
+        scalar_key=scalar_key,
+        scalar_vmin_linear=vmin_linear if _is_logspace_scalar(scalar_key) else None,
+        scalar_vmax_linear=vmax_linear if _is_logspace_scalar(scalar_key) else None,
+        label=resolved_cb_label,
+        label_fontsize=colorbar_fontsize,
+        tick_fontsize=colorbar_fontsize,
+    )
+
+    if output_path:
+        fig.savefig(output_path, dpi=400, bbox_inches="tight", pad_inches=0.03)
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Single-cell 3D shape illustrations (column / wedge / frustum / saddle)
+# ---------------------------------------------------------------------------
+
+CELL_SHAPE_KINDS = (
+    "column",
+    "wedge",
+    "frustum",
+    "saddle",
+    "stretch",
+    "stretch_rot",
+)
+
+CELL_SHAPE_SETTINGS = {
+    "window_size": (1200, 1200),
+    "elevation": 28,
+    "azimuth": 40,
+    "zoom_margin": 0.08,
+    "ambient": 0.28,
+    "diffuse": 0.85,
+    "fill_color": "#9612A0",  # plasma(~0.32), matches fig1 cmap
+    "edge_color": "#1A1A1A",  # dark ridges for clear structure
+    "edge_width": 6.0,
+    "width": 1.0,
+    "height": 1.5,
+    "constriction": 0.45,
+    "stretch_long": 1.5,   # +50% along long in-plane axis
+    "stretch_short": 0.5,  # -50% along short in-plane axis
+}
+
+
+def _cell_shape_half_extents(
+    kind: str,
+    width: float = 1.0,
+    constriction: float = 0.45,
+    stretch_long: float = 1.5,
+    stretch_short: float = 0.5,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    Return ((bottom_hx, bottom_hy), (top_hx, top_hy)) half-extents in x/y.
+
+    kind:
+      column      — full square top and bottom
+      wedge       — top shrinks in x only (1-axis frustum)
+      frustum     — top shrinks in x and y (square frustum)
+      saddle      — top shrinks in x, bottom shrinks in y
+      stretch     — prism elongated in x, contracted in y
+      stretch_rot — same as stretch, rotated 90° (elongated in y, contracted in x)
+    """
+    if kind not in CELL_SHAPE_KINDS:
+        raise ValueError(f"kind must be one of {CELL_SHAPE_KINDS}, got {kind!r}")
+    half = 0.5 * float(width)
+    ratio = float(np.clip(constriction, 0.05, 1.0))
+    narrow = half * ratio
+    long_h = half * float(stretch_long)
+    short_h = half * float(stretch_short)
+
+    if kind == "column":
+        return (half, half), (half, half)
+    if kind == "wedge":
+        return (half, half), (narrow, half)
+    if kind == "frustum":
+        return (half, half), (narrow, narrow)
+    if kind == "saddle":
+        return (half, narrow), (narrow, half)
+    if kind == "stretch":
+        return (long_h, short_h), (long_h, short_h)
+    # stretch_rot
+    return (short_h, long_h), (short_h, long_h)
+
+
+def _cell_shape_vertices(
+    kind: str,
+    width: float = 1.0,
+    height: float = 1.5,
+    constriction: float = 0.45,
+    stretch_long: float = 1.5,
+    stretch_short: float = 0.5,
+) -> np.ndarray:
+    """
+    Eight corners of a columnar cell polyhedron, shape (8, 3).
+
+    Bottom z=0 indices 0..3 (CCW from -x/-y), top z=height indices 4..7.
+    """
+    (bhx, bhy), (thx, thy) = _cell_shape_half_extents(
+        kind,
+        width=width,
+        constriction=constriction,
+        stretch_long=stretch_long,
+        stretch_short=stretch_short,
+    )
+    h = float(height)
+    bottom = np.array(
+        [
+            [-bhx, -bhy, 0.0],
+            [bhx, -bhy, 0.0],
+            [bhx, bhy, 0.0],
+            [-bhx, bhy, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    top = np.array(
+        [
+            [-thx, -thy, h],
+            [thx, -thy, h],
+            [thx, thy, h],
+            [-thx, thy, h],
+        ],
+        dtype=np.float64,
+    )
+    return np.vstack([bottom, top])
+
+
+def _cell_shape_faces() -> np.ndarray:
+    """Triangle faces for the 8-vertex columnar cell (outward winding)."""
+    # bottom (down), top (up), then four sides
+    tris = [
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [1, 2, 6],
+        [1, 6, 5],
+        [2, 3, 7],
+        [2, 7, 6],
+        [3, 0, 4],
+        [3, 4, 7],
+    ]
+    faces = []
+    for t in tris:
+        faces.extend([3, t[0], t[1], t[2]])
+    return np.asarray(faces, dtype=np.int64)
+
+
+def _cell_shape_edge_segments(vertices: np.ndarray) -> np.ndarray:
+    """Ridge segments (E, 2, 3) for bottom, top, and vertical edges."""
+    edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
+    return np.stack([vertices[list(e)] for e in edges], axis=0)
+
+
+def _cell_shape_polydata(
+    kind: str,
+    width: float = 1.0,
+    height: float = 1.5,
+    constriction: float = 0.45,
+) -> Tuple[pv.PolyData, np.ndarray]:
+    """Closed cell mesh plus ridge segments for edge overlay."""
+    verts = _cell_shape_vertices(kind, width=width, height=height, constriction=constriction)
+    poly = pv.PolyData(verts, _cell_shape_faces())
+    return poly, _cell_shape_edge_segments(verts)
+
+
+def render_cell_shape(kind: str, settings=None) -> np.ndarray:
+    """
+    Render one single-cell polyhedron to an RGBA image (transparent background).
+
+    kind: "column" | "wedge" | "frustum" | "saddle"
+    """
+    settings = {**CELL_SHAPE_SETTINGS, **(settings or {})}
+    width = float(settings["width"])
+    height = float(settings["height"])
+    constriction = float(settings["constriction"])
+
+    poly, edge_segments = _cell_shape_polydata(
+        kind, width=width, height=height, constriction=constriction
+    )
+    center = poly.center
+
+    window_size = tuple(settings["window_size"])
+    pv.global_theme.transparent_background = True
+    pl = pv.Plotter(window_size=window_size, off_screen=True)
+    pl.set_background(None)
+    pl.show_axes = False
+
+    # Invisible point cloud so camera framing matches Voronoi helpers.
+    pl.add_mesh(pv.PolyData(poly.points), opacity=0.0, point_size=0.1)
+    cam_settings = {
+        "elevation": settings["elevation"],
+        "azimuth": settings["azimuth"],
+        "zoom_margin": settings["zoom_margin"],
+    }
+    cam_pos = _setup_camera(pl, np.asarray(center, dtype=float), cam_settings)
+    pl.clear()
+
+    fill = _as_rgb(settings.get("fill_color", "#9612A0"))
+    pl.add_mesh(
+        poly,
+        color=tuple(float(c) for c in fill),
+        smooth_shading=False,
+        specular=0.0,
+        diffuse=float(settings.get("diffuse", 0.85)),
+        ambient=float(settings.get("ambient", 0.28)),
+        lighting=True,
+        show_edges=False,
+    )
+
+    n_seg = len(edge_segments)
+    if n_seg > 0:
+        points = edge_segments.reshape(-1, 3)
+        lines = np.hstack(
+            [
+                np.full((n_seg, 1), 2, dtype=np.int64),
+                np.arange(0, n_seg * 2, 2)[:, None],
+                np.arange(1, n_seg * 2, 2)[:, None],
+            ]
+        ).ravel()
+        edge_mesh = pv.PolyData(points, lines=lines)
+        edge_color = settings.get("edge_color", "#1A1A1A")
+        pl.add_mesh(
+            edge_mesh,
+            color=edge_color,
+            line_width=float(settings.get("edge_width", 6.0)),
+            lighting=False,
+            opacity=1.0,
+            render_lines_as_tubes=False,
+        )
+
+    _setup_camera(pl, np.asarray(center, dtype=float), cam_settings, position=cam_pos)
+    pl.render()
+    img = pl.screenshot(transparent_background=True, return_img=True)
+    pl.close()
+    return img
+
+
+def export_cell_shape_pngs(
+    output_dir,
+    kinds: Optional[List[str]] = None,
+    settings=None,
+    prefix: str = "cell_",
+) -> Dict[str, Path]:
+    """
+    Render and save transparent PNGs for each cell shape.
+
+    Returns a dict mapping kind -> output Path.
+    """
+    from matplotlib.image import imsave
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    kinds = list(kinds) if kinds is not None else list(CELL_SHAPE_KINDS)
+    paths: Dict[str, Path] = {}
+    for kind in kinds:
+        img = render_cell_shape(kind, settings=settings)
+        path = out / f"{prefix}{kind}.png"
+        imsave(path, np.asarray(img))
+        paths[kind] = path
+    return paths

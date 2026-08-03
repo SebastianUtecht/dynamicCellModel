@@ -70,6 +70,7 @@ class Simulation:
         self.update_x_bools = sim_dict['update_x_bools']   # List of booleans determining whether to update the parameters for each cell type. Order is [type0_alpha_par, type0_alpha_perp, type0_gamma, type1_alpha_par, type1_alpha_perp, type1_gamma]
         self.screen_out_defects = sim_dict['screen_out_defects']   # Whether to screen out defects in the neighbor calculations. Only relevant if neighbour_type is 'voronoi'
         self.wedge_pcp = sim_dict['wedge_pcp']                     # Whether to apply wedging rotations to the PCP as well as the ABP. Only relevant if alpha parameters are non-zero
+        self.grav_str = sim_dict['grav_str']                       # Strength of the gravitational force. 0 for no gravity, higher for stronger gravity. The gravity is applied in the negative z direction
         
         ### Parameters for this paper ###
         self.equi_time          = sim_dict['equi_time']             # Time to equilibrate before starting the simulation. Only relevant if stretch_factor is not 0
@@ -80,7 +81,6 @@ class Simulation:
         self.bound_extents      = [sim_dict['bound_end']]      # Extents for boundary conditions. For planes, this is the x and y extent. For cylinder, this is the radius and height
         self.bound_move_times   = [self.equi_time, sim_dict['bound_move_times']]   # If using planes, this is the times at which the planes move. For cylinder, this is the time at which the cylinder starts moving
         self.bound_continuity   = sim_dict['bound_continuity']   # Continuity for boundary conditions
-        self.bound_cur_ext      = self.bound_extents[0] if self.bound_move_times is not None else None # Current extent of the boundary. Only relevant if bound_move_times is not None
 
         # Stretching parameters
         self.stretch_factor     = sim_dict['stretch_factor']        # Strength of the stretching. 0 for no stretch, higher for stronger stretch. The stretch is applied to the cells in the stretch_frac fraction of the radius from the center
@@ -393,9 +393,17 @@ class Simulation:
             return self.cylinder_bound(pos)
         else:
             return 0.0
+
+    def grav(self, pos):
+        if self.grav_str == 0.0:
+            return 0.0
+        else:
+            grav_potential = self.grav_str * torch.sum(pos[:, 2]**2)
+            return grav_potential
         
     def planes_bound(self, pos):
-        bound_dists = torch.abs(pos[:, self.stretch_bound_axis]) - self.bound_cur_ext/2
+
+        bound_dists = torch.abs(self.mass_midpoint[self.stretch_bound_axis] - pos[:, self.stretch_bound_axis]) - self.bound_cur_ext/2
         v_add = torch.where(bound_dists > 0, 2 * bound_dists**2, 0.0)
         if torch.isnan(v_add).any() or torch.isinf(v_add).any():                        #check for nan or inf. This is mainly for debugging, but i've kept it as it sometimes does.... stuff.
             print("Warning: NaN or Inf detected in potential energy")
@@ -623,10 +631,11 @@ class Simulation:
             # If p_mask == 1 cells are not updated we don't count them for the 
             # gamma penalty
 
-            if not(self.update_x_bools[1]):
-                masked_out_cells = torch.logical_or((interaction_mask == 2) , (interaction_mask == 1)) * (~z_mask)
-            else:
-                masked_out_cells = ~z_mask
+            # if not(self.update_x_bools[1]):
+            #     masked_out_cells = torch.logical_or((interaction_mask == 2) , (interaction_mask == 1)) * (~z_mask)
+            # else:
+
+            masked_out_cells = ~z_mask
             gamma_diff = (gamma_i - gamma_j)**2
             gamma_diff[masked_out_cells] = 0.0
             gamma_diff_sum = torch.sum(gamma_diff)
@@ -635,13 +644,15 @@ class Simulation:
         if self.tstep > self.equi_time:
             # Boundary conditions
             bc = self.bound(x)
+            grav = self.grav(x)
         else:
+            grav = 0.0
             bc = 0.0
 
-        V = Vij_sum + bc
+        V = Vij_sum + bc + grav
 
         num_neighbors = torch.sum(z_mask, dim=1)           
-        Vij_normed = Vij / num_neighbofrs[:, None]       
+        Vij_normed = Vij / num_neighbors[:, None]       
         Vij_normed[~z_mask] = 0.0
         Vi = torch.sum(Vij_normed, dim=1)
 
@@ -684,8 +695,10 @@ class Simulation:
 
         # we set bound_ext[0] to the largest distance between two cells alng self.stretch_bound_axis. This is used for stretching the tissue in the right direction.
         max_dist   = torch.max(x[:,self.stretch_bound_axis]) - torch.min(x[:,self.stretch_bound_axis]) + 4.0
-        self.bound_extents =  [max_dist] + self.bound_extents
+        self.bound_extents =  [max_dist.item()] + self.bound_extents
+        print(self.bound_extents)
         self.bound_speed        = (self.bound_extents[1] - self.bound_extents[0]) / ( (self.bound_move_times[1] - self.bound_move_times[0]) )  if self.bound_move_times is not None else 0.0 # Speed of boundary movement. Only relevant if bound_move_times is not None
+        self.bound_cur_ext      = self.bound_extents[0] if self.bound_move_times is not None else None # Current extent of the boundary. Only relevant if bound_move_times is not None
 
 
         # We calculate the initial x_mass_midpoint for stretching purposes.
@@ -866,7 +879,7 @@ class Simulation:
             p, q, alpha_par, alpha_perp, gamma = self.apply_constraints(p, q, p_mask, alpha_par, alpha_perp, gamma)
 
         with torch.no_grad():
-            if self.stretch_factor != 0.0 and self.tstep > self.equi_time:
+            if self.stretch_factor != 0.0 and self.tstep >= self.equi_time:
                 if self.stretch_type == 'straight':
                     x[:,self.stretch_bound_axis][p_mask == 1] += self.stretch_factor * self.dt * torch.sign(x[p_mask == 1][:,self.stretch_bound_axis] - self.x_mass_midpoint)
                 elif self.stretch_type == 'curved':
