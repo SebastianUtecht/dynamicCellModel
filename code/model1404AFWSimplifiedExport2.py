@@ -1497,7 +1497,8 @@ def make_stretch_rectangle(length, width, stretch_frac, alpha_params=None, gamma
 
     return plain_data
 
-def make_stretch_cylinder(circumference, length, stretch_frac, polarity='par', mirrored=True, alpha_params=None, gamma_params=None):
+def make_stretch_cylinder(circumference, length, stretch_frac, polarity='par', with_caps = False,
+                           mirrored=True, alpha_params=None, gamma_params=None):
     """
     Generates cells on the surface of a cylinder with apicobasal polarities pointing radially outward and randomly initialized pcp polarities.
 
@@ -1545,8 +1546,41 @@ def make_stretch_cylinder(circumference, length, stretch_frac, polarity='par', m
         q /= np.linalg.norm(q, axis=1)[:, None]
     else:
         raise ValueError("Polarity must be either 'par' or 'perp'.")
+    
+    # we can add caps to the cylinder if with_caps is True
+    # that is, we add a filled circle of cells at the top and bottom of the cylinder
+    if with_caps:
+        cap_theta = np.linspace(0, 2 * np.pi, circumference*2, endpoint=False)
+        cap_x_top = np.zeros((circumference*2, 3))
+        cap_x_top[:, 0] = radius/2 * np.cos(cap_theta)
+        cap_x_top[:, 1] = radius/2 * np.sin(cap_theta)
+        cap_x_top[:, 2] = length*2
 
-    N = (length * circumference)
+        cap_x_bottom = np.zeros((circumference*2, 3))
+        cap_x_bottom[:, 0] = radius/2 * np.cos(cap_theta)
+        cap_x_bottom[:, 1] = radius/2 * np.sin(cap_theta)
+        cap_x_bottom[:, 2] = 0
+
+        x = np.vstack((x, cap_x_top, cap_x_bottom))
+
+        # Update p and q for the caps
+        p_top = np.zeros_like(cap_x_top)
+        p_top[:, 2] = 1
+        p_bottom = np.zeros_like(cap_x_bottom)
+        p_bottom[:, 2] = -1
+        p = np.vstack((p, p_top, p_bottom))
+
+        q_top = np.zeros_like(cap_x_top)
+        q_top[:, 0] = -np.sin(cap_theta)
+        q_top[:, 1] = np.cos(cap_theta)
+        q_bottom = np.zeros_like(cap_x_bottom)
+        q_bottom[:, 0] = -np.sin(cap_theta)
+        q_bottom[:, 1] = np.cos(cap_theta)
+        q = np.vstack((q, q_top, q_bottom))
+
+        N = (length * circumference) + 2 * circumference*2
+    else:
+        N = (length * circumference)
     # Generate cell types based on distance from the center
     mask = np.zeros(N, dtype=int)
     # All cells in the stretch_frace fraction of the radius from the center are type 1
